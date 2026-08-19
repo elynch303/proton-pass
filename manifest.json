@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.elynch303.proton-pass",
+  "name": "Proton Pass",
+  "version": "0.1.0",
+  "author": "elynch303",
+  "description": "Native-feeling Proton Pass client for the Omarchy bar: vault selection, item search, and session auto-lock, backed by the official pass-cli.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "ProtonPassWidget.qml" }
+}

@@ -78,6 +78,7 @@ BarWidget {
         }
         if (root.sessionState === "unlocked" && detail.open && prev !== "unlocked") {
           root.refreshVaultsAndItems()
+          Qt.callLater(function() { searchField.forceActiveFocus() })
         }
       }
     }
@@ -232,15 +233,13 @@ BarWidget {
   function launchUnlock() { unlockProc.running = false; unlockProc.running = true }
 
   // ── bar chrome ───────────────────────────────────────────────────────────
-  function badgeGlyph() {
-    if (root.sessionState === "locked") return "󰌾"
-    if (root.sessionState === "unlocked") return "󰌿"
-    return "󰌆"
-  }
-  function badgeColor() {
-    if (root.sessionState === "unlocked") return Color.accent
-    if (root.sessionState === "locked") return "#e8a33d"
-    return Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5)
+  // One fixed mark (icon.svg), same idea as security-scan's single glyph —
+  // state is conveyed by dimming/badging it, never by swapping the icon
+  // shape (a lock/key/unlock swap read as "wrong icon" in testing).
+  function avatarColor(title) {
+    var palette = ["#6D4AFF", "#3DA5D9", "#33A67B", "#D97757", "#B85C9E", "#4A90D9"]
+    var c = title && title.length ? title.charCodeAt(0) : 0
+    return palette[c % palette.length]
   }
   function tooltipText() {
     if (root.sessionState === "missing") return "Proton Pass not set up\nClick for setup notes"
@@ -257,12 +256,33 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.badgeGlyph()
     slotSize: Style.bar.statusSlot
     fontSize: Style.bar.iconFont
     tooltipText: root.tooltipText()
-    activeColor: root.badgeColor()
     active: root.wrapperInstalled
+    iconComponent: Component {
+      Item {
+        anchors.fill: parent
+        Image {
+          anchors.fill: parent
+          source: "icon.svg"
+          fillMode: Image.PreserveAspectFit
+          smooth: true
+          opacity: (root.sessionState === "missing" || root.sessionState === "logged-out") ? 0.4 : 1.0
+        }
+        Rectangle {
+          visible: root.sessionState === "locked"
+          width: Style.space(7)
+          height: Style.space(7)
+          radius: width / 2
+          color: "#e8a33d"
+          border.width: 1
+          border.color: Color.popups.background
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
+        }
+      }
+    }
     onPressed: {
       detail.open = !detail.open
       if (detail.open) {
@@ -282,10 +302,14 @@ BarWidget {
     contentHeight: bodyCol.implicitHeight + padding * 2
 
     onOpenChanged: {
-      if (!open) {
+      if (open) {
+        if (root.sessionState === "unlocked") Qt.callLater(function() { searchField.forceActiveFocus() })
+      } else {
         root.clearClipboardNow()
         root.copyFeedback = ""
         root.expandedKey = ""
+        root.searchQuery = ""
+        searchField.text = ""
       }
     }
 
@@ -419,7 +443,6 @@ BarWidget {
           width: parent.width
           placeholderText: "Search items..."
           foreground: Color.popups.text
-          text: root.searchQuery
           onTextChanged: root.searchQuery = text
         }
 
@@ -475,19 +498,39 @@ BarWidget {
 
                 Rectangle {
                   width: parent.width
-                  height: Style.spacing.controlHeight
+                  height: Style.space(44)
                   radius: Style.cornerRadius
                   color: rowMa.containsMouse || rowCol.expanded
                     ? Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.08)
                     : "transparent"
                   Behavior on color { ColorAnimation { duration: 100 } }
 
-                  Column {
+                  Rectangle {
+                    id: avatar
+                    width: Style.space(28)
+                    height: Style.space(28)
+                    radius: width / 2
                     anchors.left: parent.left
+                    anchors.leftMargin: Style.spacing.sm
+                    anchors.verticalCenter: parent.verticalCenter
+                    color: root.avatarColor(rowCol.modelData.title)
+                    Text {
+                      anchors.centerIn: parent
+                      text: (rowCol.modelData.title || "?").charAt(0).toUpperCase()
+                      color: "white"
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                  }
+
+                  Column {
+                    anchors.left: avatar.right
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.leftMargin: Style.spacing.sm
                     anchors.rightMargin: Style.spacing.sm
+                    spacing: Style.space(1)
                     Text {
                       width: parent.width
                       text: rowCol.modelData.title
@@ -523,7 +566,7 @@ BarWidget {
                   visible: rowCol.expanded
                   width: parent.width
                   spacing: Style.spacing.xs
-                  leftPadding: Style.spacing.sm
+                  leftPadding: Style.space(28) + Style.spacing.sm * 2
 
                   ActionBtn {
                     label: "Copy username"
@@ -545,7 +588,7 @@ BarWidget {
                 Text {
                   visible: rowCol.expanded && !rowCol.isLogin
                   width: parent.width
-                  leftPadding: Style.spacing.sm
+                  leftPadding: Style.space(28) + Style.spacing.sm * 2
                   text: "This item type isn't supported here yet — open it in the Proton Pass app."
                   color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5)
                   font.family: Style.font.family

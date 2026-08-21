@@ -293,18 +293,26 @@ BarWidget {
   }
 
   // ── popup ────────────────────────────────────────────────────────────────
-  PopupCard {
+  // KeyboardPanel, not PopupCard: PopupCard wraps Quickshell's PopupWindow
+  // (an xdg-popup), which never receives real Wayland keyboard focus unless
+  // a click/hover already routed focus through its parent surface — so a
+  // TextField inside one can look focused (blinking cursor) while every
+  // keypress is silently dropped by the compositor. That was the actual
+  // cause of the search box "not working". KeyboardPanel is built on
+  // PanelWindow + WlrLayershell.keyboardFocus specifically for panels that
+  // need real typed input (see its own header comment); `focusTarget` gets
+  // both the compositor-level prime and the Qt-level forceActiveFocus().
+  KeyboardPanel {
     id: detail
     anchorItem: button
     bar: root.bar
     owner: root
     contentWidth: Style.space(320)
     contentHeight: bodyCol.implicitHeight + padding * 2
+    focusTarget: root.sessionState === "unlocked" ? searchField : null
 
     onOpenChanged: {
-      if (open) {
-        if (root.sessionState === "unlocked") Qt.callLater(function() { searchField.forceActiveFocus() })
-      } else {
+      if (!open) {
         root.clearClipboardNow()
         root.copyFeedback = ""
         root.expandedKey = ""
@@ -438,12 +446,27 @@ BarWidget {
           onChanged: function(v) { root.selectedVaultId = v }
         }
 
-        TextField {
-          id: searchField
+        Item {
           width: parent.width
-          placeholderText: "Search items..."
-          foreground: Color.popups.text
-          onTextChanged: root.searchQuery = text
+          height: searchField.implicitHeight
+
+          TextField {
+            id: searchField
+            anchors.fill: parent
+            leftPadding: Style.space(30)
+            placeholderText: "Search items..."
+            foreground: Color.popups.text
+            onTextChanged: root.searchQuery = text
+          }
+          Text {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.spacing.sm
+            anchors.verticalCenter: parent.verticalCenter
+            text: "󰍉"
+            color: Qt.darker(Color.popups.text, 1.5)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+          }
         }
 
         Text {
@@ -509,7 +532,7 @@ BarWidget {
                     id: avatar
                     width: Style.space(28)
                     height: Style.space(28)
-                    radius: width / 2
+                    radius: Style.cornerRadius
                     anchors.left: parent.left
                     anchors.leftMargin: Style.spacing.sm
                     anchors.verticalCenter: parent.verticalCenter
@@ -524,12 +547,24 @@ BarWidget {
                     }
                   }
 
+                  Text {
+                    id: chevron
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.spacing.sm
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: rowCol.expanded ? "󰅃" : "󰅀"
+                    color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, rowMa.containsMouse || rowCol.expanded ? 0.6 : 0.3)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    Behavior on color { ColorAnimation { duration: 100 } }
+                  }
+
                   Column {
                     anchors.left: avatar.right
-                    anchors.right: parent.right
+                    anchors.right: chevron.left
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.leftMargin: Style.spacing.sm
-                    anchors.rightMargin: Style.spacing.sm
+                    anchors.rightMargin: Style.spacing.xs
                     spacing: Style.space(1)
                     Text {
                       width: parent.width

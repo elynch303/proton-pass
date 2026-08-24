@@ -18,10 +18,18 @@ import qs.Ui
 // reading /dev/tty), so both open a floating terminal rather than taking
 // input inline in the popup.
 //
-// Clipboard: secret values only ever flow from qs-protonpass.sh's stdout
-// straight into wl-copy's stdin (never a command-line arg, never a QML
-// property bound to any visible Text element), and the clipboard is
-// cleared automatically after ~35s or immediately if the popup closes.
+// Clipboard: secret values flow from qs-protonpass.sh's stdout into a QML
+// var that's never bound to any visible Text element, then out via
+// Util.execDetached (printf | wl-copy) — the same pattern the network
+// panel uses for the wifi passphrase and tailscale use for peer info.
+// A Quickshell-managed Process can't be used for the wl-copy leg: wl-copy
+// only claims the selection once its stdin hits EOF, and QML's Process
+// exposes write() but no way to close/EOF the pipe, so it just hangs
+// forever and nothing actually reaches the clipboard (confirmed with a
+// manual fifo test). execDetached's child process tree closes stdin
+// naturally when printf exits, so wl-copy backgrounds itself correctly.
+// The clipboard is cleared automatically after ~35s or immediately if the
+// popup closes.
 BarWidget {
   id: root
   moduleName: "local.proton-pass"
@@ -142,13 +150,9 @@ BarWidget {
 
   onSelectedVaultIdChanged: if (detail.open && root.sessionState === "unlocked") root.refreshVaultsAndItems()
 
-  // ── clipboard: value goes straight from process stdout to wl-copy stdin ──
-  Process {
-    id: copyProc
-    property string secret: ""
-    command: ["wl-copy"]
-    stdinEnabled: true
-    onStarted: { write(copyProc.secret + "\n"); copyProc.secret = "" }
+  // ── clipboard: detached printf|wl-copy, never a managed Process (see header) ──
+  function copyToClipboard(secret) {
+    Util.execDetached("printf %s " + Util.shellQuote(secret) + " | wl-copy")
   }
   Process {
     id: clipboardClearProc
@@ -174,8 +178,7 @@ BarWidget {
         try {
           var d = JSON.parse(text)
           if (d.value) {
-            copyProc.secret = d.value
-            copyProc.running = false; copyProc.running = true
+            root.copyToClipboard(d.value)
             clipboardClearTimer.restart()
             root.copyFeedback = "Copied " + fieldFetchProc.label
           } else {
@@ -202,8 +205,7 @@ BarWidget {
           var d = JSON.parse(text)
           var code = d.token || d.code || d.value
           if (code) {
-            copyProc.secret = String(code)
-            copyProc.running = false; copyProc.running = true
+            root.copyToClipboard(String(code))
             clipboardClearTimer.restart()
             root.copyFeedback = "Copied TOTP code"
           } else {

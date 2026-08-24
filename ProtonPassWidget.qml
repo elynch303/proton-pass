@@ -222,6 +222,95 @@ BarWidget {
     totpFetchProc.running = false; totpFetchProc.running = true
   }
 
+  // ── detail view: username + password/TOTP reveal ───────────────────────
+  // List rows never show anything beyond the metadata pass-cli's item list
+  // already returns (no username field there — confirmed against a real
+  // 626-item vault). Opening an item's detail view is a single per-item
+  // `view` call, same cost as one copy — that's what makes a real username
+  // subtitle affordable here where it wasn't for every row in the list.
+  property string detailUsername: ""
+  property bool detailUsernameLoading: false
+  property string revealedField: "" // "password" | "totp" | ""
+  property string revealedValue: ""
+
+  function findItem(key) {
+    for (var i = 0; i < root.items.length; i++) {
+      if (root.itemKey(root.items[i]) === key) return root.items[i]
+    }
+    return null
+  }
+
+  onExpandedKeyChanged: {
+    root.hideReveal()
+    root.detailUsername = ""
+    root.detailUsernameLoading = false
+    var it = root.findItem(root.expandedKey)
+    if (it && it.item_type === "login") {
+      root.detailUsernameLoading = true
+      usernameFetchProc.command = [root.wrapperScript, "view", it.share_id, it.id, "username"]
+      usernameFetchProc.running = false; usernameFetchProc.running = true
+    }
+  }
+
+  Process {
+    id: usernameFetchProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.detailUsernameLoading = false
+        try {
+          root.detailUsername = JSON.parse(text).value || ""
+        } catch (e) {
+          root.detailUsername = ""
+        }
+      }
+    }
+    onExited: root.detailUsernameLoading = false
+  }
+
+  Timer {
+    id: revealClearTimer
+    interval: 20000
+    repeat: false
+    onTriggered: root.hideReveal()
+  }
+  function hideReveal() {
+    revealClearTimer.stop()
+    root.revealedField = ""
+    root.revealedValue = ""
+  }
+  function revealField(shareId, itemId, field) {
+    if (root.revealedField === field) { root.hideReveal(); return }
+    root.revealedField = field
+    root.revealedValue = ""
+    revealFetchProc.field = field
+    revealFetchProc.command = field === "totp"
+      ? [root.wrapperScript, "totp", shareId, itemId]
+      : [root.wrapperScript, "view", shareId, itemId, field]
+    revealFetchProc.running = false; revealFetchProc.running = true
+  }
+  Process {
+    id: revealFetchProc
+    property string field: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var d = JSON.parse(text)
+          var v = revealFetchProc.field === "totp" ? (d.token || d.code || d.value) : d.value
+          if (v) {
+            root.revealedValue = String(v)
+            revealClearTimer.restart()
+          } else {
+            root.revealedField = ""
+          }
+        } catch (e) {
+          root.revealedField = ""
+        }
+      }
+    }
+  }
+
   // ── login / unlock: both need a real TTY, so both open a terminal ──────
   Process {
     id: loginProc
@@ -317,7 +406,7 @@ BarWidget {
       if (!open) {
         root.clearClipboardNow()
         root.copyFeedback = ""
-        root.expandedKey = ""
+        root.expandedKey = "" // cascades via onExpandedKeyChanged: clears reveal + detailUsername too
         root.searchQuery = ""
         searchField.text = ""
       }
@@ -350,6 +439,74 @@ BarWidget {
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
         onClicked: ab.clicked()
+      }
+    }
+
+    // ── credential field row: label + value, reveal + copy icons ──────────
+    // Matches the extension's item-detail layout: username shown plain,
+    // password/TOTP masked until explicitly revealed. Revealed values are
+    // fetched fresh (never cached beyond root.revealedValue) and auto-hide
+    // after 20s or when navigating away — see hideReveal()/onExpandedKeyChanged.
+    component FieldRow: Rectangle {
+      id: fr
+      property string label: ""
+      property string plainValue: ""
+      property bool loading: false
+      property bool secretField: false
+      property bool revealed: false
+      property string revealedText: ""
+      signal copyRequested()
+      signal revealRequested()
+
+      width: parent.width
+      height: Style.space(54)
+      radius: Style.cornerRadius
+      color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.05)
+      border.width: 1
+      border.color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.10)
+
+      Column {
+        anchors.left: parent.left
+        anchors.right: actions.left
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.leftMargin: Style.spacing.md
+        anchors.rightMargin: Style.spacing.sm
+        spacing: Style.space(2)
+        Text {
+          text: fr.label
+          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+        Text {
+          width: parent.width
+          text: fr.loading ? "Loading…" : (fr.secretField ? (fr.revealed ? fr.revealedText : "••••••••••") : fr.plainValue)
+          color: Color.popups.text
+          font.family: Style.font.family
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+        }
+      }
+
+      Row {
+        id: actions
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.rightMargin: Style.spacing.xs
+        spacing: Style.spacing.xxs
+        PanelActionButton {
+          visible: fr.secretField
+          iconText: fr.revealed ? "󰈉" : "󰈈"
+          foreground: Color.popups.text
+          tooltipText: fr.revealed ? "Hide" : "Reveal"
+          onClicked: fr.revealRequested()
+        }
+        PanelActionButton {
+          iconText: "󰆏"
+          foreground: Color.popups.text
+          tooltipText: "Copy"
+          onClicked: fr.copyRequested()
+        }
       }
     }
 
@@ -431,9 +588,9 @@ BarWidget {
         ActionBtn { label: "Unlock…"; onClicked: root.launchUnlock() }
       }
 
-      // ── unlocked: vault picker + search + item list ─────────────────────
+      // ── unlocked: list view (vault picker + search + item list) ─────────
       Column {
-        visible: root.sessionState === "unlocked"
+        visible: root.sessionState === "unlocked" && root.expandedKey === ""
         width: parent.width
         spacing: Style.spacing.md
 
@@ -487,15 +644,6 @@ BarWidget {
           font.pixelSize: Style.font.bodySmall
         }
 
-        Text {
-          visible: root.copyFeedback !== ""
-          width: parent.width
-          text: root.copyFeedback + " — clears in 35s"
-          color: Color.accent
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
-        }
-
         Flickable {
           id: itemsFlickable
           width: parent.width
@@ -512,129 +660,207 @@ BarWidget {
 
             Repeater {
               model: root.filteredItems
-              delegate: Column {
+              delegate: Rectangle {
                 id: rowCol
                 required property var modelData
                 readonly property string key: root.itemKey(modelData)
-                readonly property bool expanded: root.expandedKey === key
-                readonly property bool isLogin: modelData.item_type === "login"
                 width: itemsCol.width
-                spacing: Style.spacing.xxs
+                height: Style.space(44)
+                radius: Style.cornerRadius
+                color: rowMa.containsMouse
+                  ? Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.08)
+                  : "transparent"
+                Behavior on color { ColorAnimation { duration: 100 } }
 
                 Rectangle {
-                  width: parent.width
-                  height: Style.space(44)
+                  id: avatar
+                  width: Style.space(28)
+                  height: Style.space(28)
                   radius: Style.cornerRadius
-                  color: rowMa.containsMouse || rowCol.expanded
-                    ? Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.08)
-                    : "transparent"
-                  Behavior on color { ColorAnimation { duration: 100 } }
-
-                  Rectangle {
-                    id: avatar
-                    width: Style.space(28)
-                    height: Style.space(28)
-                    radius: Style.cornerRadius
-                    anchors.left: parent.left
-                    anchors.leftMargin: Style.spacing.sm
-                    anchors.verticalCenter: parent.verticalCenter
-                    color: root.avatarColor(rowCol.modelData.title)
-                    Text {
-                      anchors.centerIn: parent
-                      text: (rowCol.modelData.title || "?").charAt(0).toUpperCase()
-                      color: "white"
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
-                      font.bold: true
-                    }
-                  }
-
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.spacing.sm
+                  anchors.verticalCenter: parent.verticalCenter
+                  color: root.avatarColor(rowCol.modelData.title)
                   Text {
-                    id: chevron
-                    anchors.right: parent.right
-                    anchors.rightMargin: Style.spacing.sm
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: rowCol.expanded ? "󰅃" : "󰅀"
-                    color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, rowMa.containsMouse || rowCol.expanded ? 0.6 : 0.3)
+                    anchors.centerIn: parent
+                    text: (rowCol.modelData.title || "?").charAt(0).toUpperCase()
+                    color: "white"
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
-                    Behavior on color { ColorAnimation { duration: 100 } }
-                  }
-
-                  Column {
-                    anchors.left: avatar.right
-                    anchors.right: chevron.left
-                    anchors.verticalCenter: parent.verticalCenter
-                    anchors.leftMargin: Style.spacing.sm
-                    anchors.rightMargin: Style.spacing.xs
-                    spacing: Style.space(1)
-                    Text {
-                      width: parent.width
-                      text: rowCol.modelData.title
-                      color: Color.popups.text
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.body
-                      elide: Text.ElideRight
-                    }
-                    Text {
-                      width: parent.width
-                      visible: text !== ""
-                      text: rowCol.modelData.vault_name || ""
-                      color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.45)
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
-                      elide: Text.ElideRight
-                    }
-                  }
-
-                  MouseArea {
-                    id: rowMa
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: {
-                      root.copyFeedback = ""
-                      root.expandedKey = rowCol.expanded ? "" : rowCol.key
-                    }
-                  }
-                }
-
-                Row {
-                  visible: rowCol.expanded
-                  width: parent.width
-                  spacing: Style.spacing.xs
-                  leftPadding: Style.space(28) + Style.spacing.sm * 2
-
-                  ActionBtn {
-                    label: "Copy username"
-                    visible: rowCol.isLogin
-                    onClicked: root.copyField(rowCol.modelData.share_id, rowCol.modelData.id, "username", "username")
-                  }
-                  ActionBtn {
-                    label: "Copy password"
-                    visible: rowCol.isLogin
-                    onClicked: root.copyField(rowCol.modelData.share_id, rowCol.modelData.id, "password", "password")
-                  }
-                  ActionBtn {
-                    label: "Copy TOTP"
-                    visible: rowCol.isLogin
-                    onClicked: root.copyTotp(rowCol.modelData.share_id, rowCol.modelData.id)
+                    font.bold: true
                   }
                 }
 
                 Text {
-                  visible: rowCol.expanded && !rowCol.isLogin
-                  width: parent.width
-                  leftPadding: Style.space(28) + Style.spacing.sm * 2
-                  text: "This item type isn't supported here yet — open it in the Proton Pass app."
-                  color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5)
+                  id: navArrow
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.spacing.sm
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "󰅂"
+                  color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, rowMa.containsMouse ? 0.6 : 0.3)
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
-                  wrapMode: Text.Wrap
+                  Behavior on color { ColorAnimation { duration: 100 } }
+                }
+
+                Column {
+                  anchors.left: avatar.right
+                  anchors.right: navArrow.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.spacing.sm
+                  anchors.rightMargin: Style.spacing.xs
+                  spacing: Style.space(1)
+                  Text {
+                    width: parent.width
+                    text: rowCol.modelData.title
+                    color: Color.popups.text
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.body
+                    elide: Text.ElideRight
+                  }
+                  Text {
+                    width: parent.width
+                    visible: text !== ""
+                    text: rowCol.modelData.vault_name || ""
+                    color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.45)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+                }
+
+                MouseArea {
+                  id: rowMa
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.copyFeedback = ""
+                    root.expandedKey = rowCol.key
+                  }
                 }
               }
             }
           }
+        }
+      }
+
+      // ── unlocked: item detail (username/password/TOTP fields) ───────────
+      Column {
+        id: detailCol
+        visible: root.sessionState === "unlocked" && root.expandedKey !== ""
+        width: parent.width
+        spacing: Style.spacing.md
+
+        readonly property var item: root.findItem(root.expandedKey)
+        readonly property bool isLogin: detailCol.item && detailCol.item.item_type === "login"
+
+        PanelSeparator { foreground: Color.popups.text }
+
+        Item {
+          width: parent.width
+          height: Math.max(Style.space(28), backBtn.height)
+
+          PanelActionButton {
+            id: backBtn
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: "󰅁"
+            foreground: Color.popups.text
+            tooltipText: "Back"
+            onClicked: root.expandedKey = ""
+          }
+          Rectangle {
+            id: detailAvatar
+            width: Style.space(28)
+            height: Style.space(28)
+            radius: Style.cornerRadius
+            anchors.left: backBtn.right
+            anchors.leftMargin: Style.spacing.sm
+            anchors.verticalCenter: parent.verticalCenter
+            color: root.avatarColor(detailCol.item ? detailCol.item.title : "")
+            Text {
+              anchors.centerIn: parent
+              text: (detailCol.item && detailCol.item.title ? detailCol.item.title : "?").charAt(0).toUpperCase()
+              color: "white"
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+          }
+          Column {
+            anchors.left: detailAvatar.right
+            anchors.right: parent.right
+            anchors.leftMargin: Style.spacing.sm
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(1)
+            Text {
+              width: parent.width
+              text: detailCol.item ? detailCol.item.title : ""
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+              font.bold: true
+              elide: Text.ElideRight
+            }
+            Text {
+              width: parent.width
+              visible: text !== ""
+              text: detailCol.item ? (detailCol.item.vault_name || "") : ""
+              color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.45)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+          }
+        }
+
+        Column {
+          visible: detailCol.isLogin
+          width: parent.width
+          spacing: Style.spacing.xs
+
+          FieldRow {
+            label: "Username"
+            loading: root.detailUsernameLoading
+            plainValue: root.detailUsername
+            onCopyRequested: root.copyField(detailCol.item.share_id, detailCol.item.id, "username", "username")
+          }
+          FieldRow {
+            label: "Password"
+            secretField: true
+            revealed: root.revealedField === "password"
+            revealedText: root.revealedValue
+            onRevealRequested: root.revealField(detailCol.item.share_id, detailCol.item.id, "password")
+            onCopyRequested: root.copyField(detailCol.item.share_id, detailCol.item.id, "password", "password")
+          }
+          FieldRow {
+            label: "2FA code"
+            secretField: true
+            revealed: root.revealedField === "totp"
+            revealedText: root.revealedValue
+            onRevealRequested: root.revealField(detailCol.item.share_id, detailCol.item.id, "totp")
+            onCopyRequested: root.copyTotp(detailCol.item.share_id, detailCol.item.id)
+          }
+        }
+
+        Text {
+          visible: detailCol.item && !detailCol.isLogin
+          width: parent.width
+          text: "This item type isn't supported here yet — open it in the Proton Pass app."
+          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.Wrap
+        }
+
+        Text {
+          visible: root.copyFeedback !== ""
+          width: parent.width
+          text: root.copyFeedback + " — clears in 35s"
+          color: Color.accent
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
         }
       }
     }

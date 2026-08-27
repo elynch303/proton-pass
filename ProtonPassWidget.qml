@@ -39,6 +39,22 @@ BarWidget {
 
   property bool wrapperInstalled: false
   property string sessionState: "missing" // missing | logged-out | locked | unlocked
+  property bool hasLock: false // auto-lock configured at all (independent of current lock state)
+  property var configuredIdleTimeout: null // seconds, read back from pass-cli once a lock exists
+
+  // ── PIN entry: unlock, and the two-step (enter/confirm) create-lock flow ──
+  // pass-cli's lock code is its own secret, independent of any browser
+  // extension's PIN — there's no API to read or reuse an extension's PIN or
+  // its configured timeout, and this widget must work with pass-cli alone
+  // (most installs won't have any particular browser extension present at
+  // all). The idle-timeout is whatever the user types during setup below;
+  // 300s (pass-cli's own default) is just the pre-filled starting value.
+  readonly property int lockIdleTimeoutDefault: 300
+  property string lockSetupIdleTimeoutText: String(lockIdleTimeoutDefault)
+  property string lockSetupStage: "" // "" | "enter" | "confirm"
+  property string lockSetupFirstCode: ""
+  property bool pinBusy: false
+  property string pinError: ""
 
   property var vaults: []             // [{value: share_id, label: name}]
   property string selectedVaultId: "" // "" = all vaults
@@ -80,9 +96,19 @@ BarWidget {
       onStreamFinished: {
         var prev = root.sessionState
         try {
-          root.sessionState = (JSON.parse(text).state) || "logged-out"
+          var d = JSON.parse(text)
+          root.sessionState = d.state || "logged-out"
+          root.hasLock = !!d.hasLock
+          root.configuredIdleTimeout = (d.idleTimeout !== undefined && d.idleTimeout !== null) ? d.idleTimeout : null
         } catch (e) {
           root.sessionState = "logged-out"
+          root.hasLock = false
+          root.configuredIdleTimeout = null
+        }
+        if (root.sessionState !== "locked") {
+          root.pinError = ""
+          root.lockSetupStage = ""
+          root.lockSetupFirstCode = ""
         }
         if (root.sessionState === "unlocked" && detail.open && prev !== "unlocked") {
           root.refreshVaultsAndItems()
@@ -229,6 +255,8 @@ BarWidget {
   // `view` call, same cost as one copy — that's what makes a real username
   // subtitle affordable here where it wasn't for every row in the list.
   property string detailUsername: ""
+  property var detailUrls: []
+  property string detailModified: ""
   property bool detailUsernameLoading: false
   property string revealedField: "" // "password" | "totp" | ""
   property string revealedValue: ""
@@ -243,11 +271,13 @@ BarWidget {
   onExpandedKeyChanged: {
     root.hideReveal()
     root.detailUsername = ""
+    root.detailUrls = []
+    root.detailModified = ""
     root.detailUsernameLoading = false
     var it = root.findItem(root.expandedKey)
     if (it && it.item_type === "login") {
       root.detailUsernameLoading = true
-      usernameFetchProc.command = [root.wrapperScript, "view", it.share_id, it.id, "username"]
+      usernameFetchProc.command = [root.wrapperScript, "detail", it.share_id, it.id]
       usernameFetchProc.running = false; usernameFetchProc.running = true
     }
   }
@@ -259,9 +289,14 @@ BarWidget {
       onStreamFinished: {
         root.detailUsernameLoading = false
         try {
-          root.detailUsername = JSON.parse(text).value || ""
+          var d = JSON.parse(text)
+          root.detailUsername = d.username || ""
+          root.detailUrls = d.urls || []
+          root.detailModified = d.modify_time || ""
         } catch (e) {
           root.detailUsername = ""
+          root.detailUrls = []
+          root.detailModified = ""
         }
       }
     }
@@ -311,17 +346,164 @@ BarWidget {
     }
   }
 
-  // ── login / unlock: both need a real TTY, so both open a terminal ──────
+  // ── login: still needs a real TTY (one-time interactive web-login/2FA),
+  // so it opens a terminal. Lock-code entry (unlock/create-lock/remove-lock)
+  // is now inline via the pty-wrapped qs-protonpass-tty.py helper — the
+  // code is written once to the Process's stdin and read with a line read
+  // on the far end, not a wl-copy-style EOF claim, so a plain write() here
+  // is sufficient (unlike the clipboard case documented above).
   Process {
     id: loginProc
     command: ["omarchy-launch-floating-terminal-with-presentation", "pass-cli login"]
   }
+  function launchLogin() { loginProc.running = false; loginProc.running = true }
+
   Process {
-    id: unlockProc
-    command: ["omarchy-launch-floating-terminal-with-presentation", "pass-cli session unlock"]
+    id: unlockPinProc
+    property string pendingCode: ""
+    command: [root.wrapperScript, "unlock"]
+    stdinEnabled: true
+    onStarted: { write(pendingCode + "\n"); pendingCode = "" }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.pinBusy = false
+        var ok = false
+        try { ok = JSON.parse(text).ok === true } catch (e) { ok = false }
+        if (ok) {
+          root.pinError = ""
+          root.refreshStatus()
+        } else {
+          root.pinError = "Incorrect PIN"
+          pinUnlockBoxes.clear()
+        }
+      }
+    }
   }
-  function launchLogin()  { loginProc.running = false;  loginProc.running = true }
-  function launchUnlock() { unlockProc.running = false; unlockProc.running = true }
+  function submitUnlockPin(code) {
+    root.pinBusy = true
+    root.pinError = ""
+    unlockPinProc.pendingCode = code
+    unlockPinProc.running = false
+    unlockPinProc.running = true
+  }
+
+  function clampedIdleTimeout() {
+    var n = parseInt(root.lockSetupIdleTimeoutText, 10)
+    if (!isFinite(n)) n = root.lockIdleTimeoutDefault
+    return Math.max(30, Math.min(900, n))
+  }
+
+  Process {
+    id: createLockProc
+    property string pendingCode: ""
+    property int idleTimeout: 300
+    command: [root.wrapperScript, "create-lock", String(idleTimeout)]
+    stdinEnabled: true
+    onStarted: { write(pendingCode + "\n"); pendingCode = "" }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.pinBusy = false
+        var ok = false
+        try { ok = JSON.parse(text).ok === true } catch (e) { ok = false }
+        if (ok) {
+          root.lockSetupStage = ""
+          root.lockSetupFirstCode = ""
+          root.pinError = ""
+          root.refreshStatus()
+        } else {
+          root.pinError = "Couldn't set up auto-lock — try again"
+          root.lockSetupStage = "enter"
+          root.lockSetupFirstCode = ""
+          pinSetupBoxes.clear()
+        }
+      }
+    }
+  }
+  function submitCreateLock(code) {
+    root.pinBusy = true
+    root.pinError = ""
+    createLockProc.idleTimeout = root.clampedIdleTimeout()
+    createLockProc.pendingCode = code
+    createLockProc.running = false
+    createLockProc.running = true
+  }
+  function startLockSetup() {
+    root.lockSetupStage = "enter"
+    root.lockSetupFirstCode = ""
+    root.lockSetupIdleTimeoutText = String(root.lockIdleTimeoutDefault)
+    root.pinError = ""
+  }
+  function cancelLockSetup() {
+    root.lockSetupStage = ""
+    root.lockSetupFirstCode = ""
+    root.pinError = ""
+  }
+  function onLockSetupBoxesCompleted(code) {
+    if (root.lockSetupStage === "enter") {
+      root.lockSetupFirstCode = code
+      root.lockSetupStage = "confirm"
+      root.pinError = ""
+      Qt.callLater(function() { pinSetupBoxes.clear() })
+    } else if (root.lockSetupStage === "confirm") {
+      if (code === root.lockSetupFirstCode) {
+        root.submitCreateLock(code)
+      } else {
+        root.pinError = "PINs didn't match — try again"
+        root.lockSetupStage = "enter"
+        root.lockSetupFirstCode = ""
+        pinSetupBoxes.clear()
+      }
+    } else if (root.lockSetupStage === "remove") {
+      root.submitRemoveLock(code)
+    }
+  }
+  function startLockRemoval() {
+    root.lockSetupStage = "remove"
+    root.pinError = ""
+  }
+
+  Process {
+    id: removeLockProc
+    property string pendingCode: ""
+    command: [root.wrapperScript, "remove-lock"]
+    stdinEnabled: true
+    onStarted: { write(pendingCode + "\n"); pendingCode = "" }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.pinBusy = false
+        var ok = false
+        try { ok = JSON.parse(text).ok === true } catch (e) { ok = false }
+        if (ok) {
+          root.lockSetupStage = ""
+          root.pinError = ""
+          root.refreshStatus()
+        } else {
+          root.pinError = "Incorrect PIN"
+          pinSetupBoxes.clear()
+        }
+      }
+    }
+  }
+  function submitRemoveLock(code) {
+    root.pinBusy = true
+    root.pinError = ""
+    removeLockProc.pendingCode = code
+    removeLockProc.running = false
+    removeLockProc.running = true
+  }
+
+  Process {
+    id: logoutProc
+    command: [root.wrapperScript, "logout"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.refreshStatus()
+    }
+  }
+  function signOut() { logoutProc.running = false; logoutProc.running = true }
 
   // ── bar chrome ───────────────────────────────────────────────────────────
   // One fixed mark (icon.svg), same idea as security-scan's single glyph —
@@ -363,14 +545,21 @@ BarWidget {
         }
         Rectangle {
           visible: root.sessionState === "locked"
-          width: Style.space(7)
-          height: Style.space(7)
+          width: Style.space(11)
+          height: Style.space(11)
           radius: width / 2
           color: "#e8a33d"
           border.width: 1
           border.color: Color.popups.background
           anchors.right: parent.right
           anchors.bottom: parent.bottom
+          Text {
+            anchors.centerIn: parent
+            text: "󰌾" // md-lock, verified via fontTools against the live Nerd Font
+            color: "#1a1400"
+            font.family: Style.font.family
+            font.pixelSize: Style.space(8)
+          }
         }
       }
     }
@@ -400,7 +589,10 @@ BarWidget {
     owner: root
     contentWidth: Style.space(320)
     contentHeight: bodyCol.implicitHeight + padding * 2
-    focusTarget: root.sessionState === "unlocked" ? searchField : null
+    focusTarget: root.sessionState === "locked" ? pinUnlockBoxes
+      : (root.sessionState === "unlocked" && root.lockSetupStage !== "") ? pinSetupBoxes
+      : (root.sessionState === "unlocked") ? searchField
+      : null
 
     onOpenChanged: {
       if (!open) {
@@ -409,6 +601,8 @@ BarWidget {
         root.expandedKey = "" // cascades via onExpandedKeyChanged: clears reveal + detailUsername too
         root.searchQuery = ""
         searchField.text = ""
+        root.cancelLockSetup()
+        root.pinError = ""
       }
     }
 
@@ -439,6 +633,95 @@ BarWidget {
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
         onClicked: ab.clicked()
+      }
+    }
+
+    // ── 6-digit PIN entry: auto-advances on digit entry, backspace steps
+    // back into an empty box, submits via `completed` once all boxes are
+    // filled. FocusScope so `KeyboardPanel.focusTarget` can point at the
+    // whole component and still land keyboard focus on whichever box is
+    // logically focused (box 0 initially, or wherever clear()/focusIndex()
+    // last left it) — a plain Item can't receive forceActiveFocus() and
+    // hand it to the right descendant.
+    component PinBoxes: FocusScope {
+      id: pinBoxes
+      property int length: 6
+      property bool enabled: true
+      signal completed(string code)
+
+      implicitWidth: pinRow.implicitWidth
+      implicitHeight: pinRow.implicitHeight
+
+      function currentCode() {
+        var s = ""
+        for (var i = 0; i < pinRepeater.count; i++) {
+          var it = pinRepeater.itemAt(i)
+          s += it ? it.textInput.text : ""
+        }
+        return s
+      }
+      function focusIndex(i) {
+        var it = pinRepeater.itemAt(i)
+        if (it) it.textInput.forceActiveFocus()
+      }
+      function clear() {
+        for (var i = 0; i < pinRepeater.count; i++) {
+          var it = pinRepeater.itemAt(i)
+          if (it) it.textInput.text = ""
+        }
+        Qt.callLater(function() { pinBoxes.focusIndex(0) })
+      }
+
+      Row {
+        id: pinRow
+        spacing: Style.spacing.sm
+        Repeater {
+          id: pinRepeater
+          model: pinBoxes.length
+          delegate: Rectangle {
+            id: box
+            required property int index
+            property TextInput textInput: input
+            width: Style.space(38)
+            height: Style.space(46)
+            radius: Style.cornerRadius
+            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.05)
+            border.width: input.activeFocus ? 2 : 1
+            border.color: input.activeFocus ? Color.accent : Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.15)
+            Behavior on border.color { ColorAnimation { duration: 100 } }
+
+            TextInput {
+              id: input
+              anchors.fill: parent
+              focus: box.index === 0
+              horizontalAlignment: TextInput.AlignHCenter
+              verticalAlignment: TextInput.AlignVCenter
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.subtitle
+              maximumLength: 1
+              echoMode: TextInput.Password
+              passwordCharacter: "•"
+              enabled: pinBoxes.enabled
+              selectByMouse: true
+              onTextChanged: {
+                if (text.length > 1) { text = text.slice(-1); return }
+                if (text.length === 1 && !/[0-9]/.test(text)) { text = ""; return }
+                if (text.length === 1) {
+                  if (box.index < pinBoxes.length - 1) pinBoxes.focusIndex(box.index + 1)
+                  var code = pinBoxes.currentCode()
+                  if (code.length === pinBoxes.length) pinBoxes.completed(code)
+                }
+              }
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Backspace && text.length === 0 && box.index > 0) {
+                  pinBoxes.focusIndex(box.index - 1)
+                  event.accepted = true
+                }
+              }
+            }
+          }
+        }
       }
     }
 
@@ -571,30 +854,217 @@ BarWidget {
         ActionBtn { label: "Log in…"; onClicked: root.launchLogin() }
       }
 
-      // ── locked ───────────────────────────────────────────────────────────
+      // ── locked: inline PIN unlock, styled after the extension's own
+      // lock screen (logo, title, subtitle, 6 boxes, Sign out link) ───────
       Column {
         visible: root.sessionState === "locked"
         width: parent.width
-        spacing: Style.spacing.md
+        spacing: Style.spacing.lg
+
         PanelSeparator { foreground: Color.popups.text }
+
+        Image {
+          anchors.horizontalCenter: parent.horizontalCenter
+          source: "icon.svg"
+          sourceSize.width: Style.space(48)
+          sourceSize.height: Style.space(48)
+          fillMode: Image.PreserveAspectFit
+        }
         Text {
           width: parent.width
-          text: "Session is locked."
-          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.6)
+          horizontalAlignment: Text.AlignHCenter
+          text: "Unlock Proton Pass"
+          color: Color.popups.text
+          font.family: Style.font.family
+          font.pixelSize: Style.font.subtitle
+          font.bold: true
+        }
+        Text {
+          width: parent.width
+          horizontalAlignment: Text.AlignHCenter
+          text: "Enter your PIN code"
+          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.55)
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
+        }
+
+        Item {
+          width: parent.width
+          height: pinUnlockBoxes.implicitHeight
+          PinBoxes {
+            id: pinUnlockBoxes
+            anchors.horizontalCenter: parent.horizontalCenter
+            enabled: !root.pinBusy
+            onCompleted: function(code) { root.submitUnlockPin(code) }
+          }
+        }
+
+        Text {
+          width: parent.width
+          horizontalAlignment: Text.AlignHCenter
+          visible: root.pinBusy || root.pinError !== ""
+          text: root.pinBusy ? "Unlocking…" : root.pinError
+          color: root.pinBusy ? Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5) : Color.urgent
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        Text {
+          width: parent.width
+          horizontalAlignment: Text.AlignHCenter
+          text: "Sign out"
+          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, signOutMa.containsMouse ? 0.8 : 0.45)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          font.underline: signOutMa.containsMouse
+
+          MouseArea {
+            id: signOutMa
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.signOut()
+          }
+        }
+      }
+
+      // ── unlocked: auto-lock set up / change, PIN entry (enter → confirm,
+      // or a single entry to confirm removal) ─────────────────────────────
+      Column {
+        visible: root.sessionState === "unlocked" && root.lockSetupStage !== ""
+        width: parent.width
+        spacing: Style.spacing.lg
+
+        PanelSeparator { foreground: Color.popups.text }
+
+        Text {
+          width: parent.width
+          horizontalAlignment: Text.AlignHCenter
+          text: root.lockSetupStage === "enter" ? "Choose a PIN"
+            : root.lockSetupStage === "confirm" ? "Confirm your PIN"
+            : "Enter your PIN to remove auto-lock"
+          color: Color.popups.text
+          font.family: Style.font.family
+          font.pixelSize: Style.font.body
+          font.bold: true
           wrapMode: Text.Wrap
         }
-        ActionBtn { label: "Unlock…"; onClicked: root.launchUnlock() }
+        Text {
+          width: parent.width
+          visible: root.lockSetupStage === "enter"
+          horizontalAlignment: Text.AlignHCenter
+          text: "Pick a 6-digit PIN and how long you can be idle before it locks."
+          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.Wrap
+        }
+
+        Row {
+          visible: root.lockSetupStage === "enter"
+          anchors.horizontalCenter: parent.horizontalCenter
+          spacing: Style.spacing.sm
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Lock after"
+            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.6)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+          TextField {
+            id: idleTimeoutField
+            width: Style.space(64)
+            verticalPadding: Style.space(2)
+            foreground: Color.popups.text
+            text: root.lockSetupIdleTimeoutText
+            validator: IntValidator { bottom: 30; top: 900 }
+            onTextChanged: root.lockSetupIdleTimeoutText = text
+          }
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            text: "s idle (30–900)"
+            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.6)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        Item {
+          width: parent.width
+          height: pinSetupBoxes.implicitHeight
+          PinBoxes {
+            id: pinSetupBoxes
+            anchors.horizontalCenter: parent.horizontalCenter
+            enabled: !root.pinBusy
+            onCompleted: function(code) { root.onLockSetupBoxesCompleted(code) }
+          }
+        }
+
+        Text {
+          width: parent.width
+          horizontalAlignment: Text.AlignHCenter
+          visible: root.pinBusy || root.pinError !== ""
+          text: root.pinBusy ? "Working…" : root.pinError
+          color: root.pinBusy ? Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5) : Color.urgent
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        ActionBtn { label: "Cancel"; onClicked: root.cancelLockSetup() }
       }
 
       // ── unlocked: list view (vault picker + search + item list) ─────────
       Column {
-        visible: root.sessionState === "unlocked" && root.expandedKey === ""
+        visible: root.sessionState === "unlocked" && root.expandedKey === "" && root.lockSetupStage === ""
         width: parent.width
         spacing: Style.spacing.md
 
         PanelSeparator { foreground: Color.popups.text }
+
+        // Auto-lock status/setup — only pass-cli's own lock exists here,
+        // separate from (and unreadable from) the browser extension's PIN;
+        // see the header comment for why we can't just reuse the extension's.
+        Item {
+          width: parent.width
+          height: lockStatusRow.implicitHeight
+          Row {
+            id: lockStatusRow
+            width: parent.width
+            spacing: Style.spacing.sm
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              text: "󰌾"
+              color: root.hasLock ? Color.accent : Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.4)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+            }
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              width: parent.width - Style.space(24) - autoLockLink.implicitWidth - Style.spacing.sm * 2
+              text: root.hasLock ? ("Auto-lock on · " + (root.configuredIdleTimeout !== null ? root.configuredIdleTimeout + "s idle" : "idle timeout unknown")) : "Auto-lock isn't set up"
+              color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.6)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+            Text {
+              id: autoLockLink
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.hasLock ? "Remove" : "Set up"
+              color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, autoLockMa.containsMouse ? 1.0 : 0.8)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.underline: autoLockMa.containsMouse
+              MouseArea {
+                id: autoLockMa
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.hasLock ? root.startLockRemoval() : root.startLockSetup()
+              }
+            }
+          }
+        }
 
         SearchableDropdown {
           width: parent.width
@@ -841,6 +1311,38 @@ BarWidget {
             revealedText: root.revealedValue
             onRevealRequested: root.revealField(detailCol.item.share_id, detailCol.item.id, "totp")
             onCopyRequested: root.copyTotp(detailCol.item.share_id, detailCol.item.id)
+          }
+          FieldRow {
+            visible: root.detailUrls.length > 0
+            label: "Website"
+            plainValue: root.detailUrls.length > 0 ? root.detailUrls[0] : ""
+            onCopyRequested: {
+              root.copyToClipboard(root.detailUrls[0])
+              root.copyFeedback = "Copied website"
+            }
+          }
+        }
+
+        // Not a secret field, so no card / no copy action — just metadata,
+        // same as the extension's plain (uncarded) detail rows.
+        Column {
+          visible: detailCol.isLogin && root.detailModified !== ""
+          width: parent.width
+          spacing: Style.space(2)
+          Text {
+            text: "Last modified"
+            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.45)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+          Text {
+            text: {
+              var d = new Date(root.detailModified)
+              return isNaN(d.getTime()) ? root.detailModified : Qt.formatDateTime(d, "MMM d, yyyy · h:mm AP")
+            }
+            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.7)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
           }
         }
 

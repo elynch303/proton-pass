@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Install step for the Proton Pass plugin.
-# Copies qs-protonpass.sh to ~/.local/bin/ — the widget shells out to it for
-# every pass-cli interaction.
+# Copies qs-protonpass.sh and qs-protonpass-tty.py to ~/.local/bin/ — the
+# widget shells out to the former for every pass-cli interaction, which in
+# turn calls the latter for the three lock-code prompts (unlock/create-lock/
+# remove-lock) that need a real TTY.
 #
 # Usage:
 #   bash install.sh          # asks before overwriting an existing install
@@ -10,8 +12,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${HOME}/.local/bin"
-SRC="$SCRIPT_DIR/qs-protonpass.sh"
-DST="$BIN_DIR/qs-protonpass.sh"
 
 assume_yes=false
 for arg in "$@"; do
@@ -20,15 +20,18 @@ for arg in "$@"; do
   esac
 done
 
-if [[ -e "$DST" && "$assume_yes" != true ]]; then
-  read -rp "$DST already exists — overwrite? [y/N] " reply
-  [[ "$reply" =~ ^[Yy]$ ]] || { echo "Skipped."; exit 0; }
-fi
-
 mkdir -p "$BIN_DIR"
-cp "$SRC" "$DST"
-chmod +x "$DST"
-echo "Installed $DST"
+for name in qs-protonpass.sh qs-protonpass-tty.py; do
+  src="$SCRIPT_DIR/$name"
+  dst="$BIN_DIR/$name"
+  if [[ -e "$dst" && "$assume_yes" != true ]]; then
+    read -rp "$dst already exists — overwrite? [y/N] " reply
+    [[ "$reply" =~ ^[Yy]$ ]] || { echo "Skipped $name."; continue; }
+  fi
+  cp "$src" "$dst"
+  chmod +x "$dst"
+  echo "Installed $dst"
+done
 
 if ! command -v pass-cli >/dev/null 2>&1; then
   echo

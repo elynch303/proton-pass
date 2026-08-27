@@ -7,14 +7,17 @@
 # prints {"error": "<message>"} to stdout and exits non-zero, so the widget
 # can branch on a single shape either way.
 #
-# pass-cli's own lock/unlock/create-lock prompt for the lock code on a real
-# TTY (confirmed: piping the code via stdin fails with "No such device or
-# address" reading /dev/tty) — so `lock`/`unlock` here just proxy exit
-# status, and the widget drives the actual code entry through a floating
-# terminal, the same way it drives `pass-cli login`.
+# pass-cli's own lock/unlock/create-lock/remove-lock prompt for the lock
+# code on a real TTY (confirmed: piping the code via stdin fails with "No
+# such device or address" reading /dev/tty). qs-protonpass-tty.py wraps
+# those three in a pty so the code can come from this script's own stdin
+# instead — see its header for the full explanation. `lock` needs no code
+# and no TTY, so it's a direct proxy.
 set -uo pipefail
 
 PASS_CLI="${QS_PROTONPASS_CLI:-pass-cli}"
+TTY_HELPER="${QS_PROTONPASS_TTY_HELPER:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/qs-protonpass-tty.py}"
+[ -x "$TTY_HELPER" ] || TTY_HELPER="$HOME/.local/bin/qs-protonpass-tty.py"
 
 _err() {
   python3 -c 'import json,sys; print(json.dumps({"error": sys.argv[1]}))' "$1"
@@ -31,19 +34,20 @@ cmd_status() {
   fi
   local out
   if out="$("$PASS_CLI" info --output json 2>&1)"; then
-    local has_lock
+    local has_lock idle_timeout
     has_lock="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_has_lock", False))' 2>/dev/null)"
     if [ "$has_lock" = "True" ]; then
+      idle_timeout="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_lock_after_seconds", ""))' 2>/dev/null)"
       # session_has_lock only tells us a lock exists, not whether it's
       # currently engaged; a locked session fails ordinary calls like
       # `vault list` below, which is what actually distinguishes the two.
       if "$PASS_CLI" vault list --output json >/dev/null 2>&1; then
-        printf '{"state":"unlocked"}\n'
+        printf '{"state":"unlocked","hasLock":true,"idleTimeout":%s}\n' "${idle_timeout:-null}"
       else
         printf '{"state":"locked"}\n'
       fi
     else
-      printf '{"state":"unlocked"}\n'
+      printf '{"state":"unlocked","hasLock":false}\n'
     fi
     return 0
   fi
@@ -127,6 +131,33 @@ print(json.dumps({"value": val}))
 ' "$out" "$field"
 }
 
+# Non-secret detail-view fields in one call (username, urls, timestamps) —
+# replaces a separate per-field `view` call for each; username is not
+# treated as secret elsewhere in this script either.
+cmd_detail() {
+  _require_cli || { _err "pass-cli not installed"; return 1; }
+  local share_id="${1:-}" item_id="${2:-}"
+  if [ -z "$share_id" ] || [ -z "$item_id" ]; then
+    _err "usage: detail SHARE_ID ITEM_ID"
+    return 1
+  fi
+
+  local out
+  out="$("$PASS_CLI" item view --share-id "$share_id" --item-id "$item_id" --output json 2>/dev/null)" || { _err "failed to view item"; return 1; }
+
+  python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+item = d.get("item", {})
+login = item.get("content", {}).get("content", {}).get("Login", {})
+print(json.dumps({
+    "username": login.get("username", ""),
+    "urls": login.get("urls", []) or [],
+    "modify_time": item.get("modify_time"),
+}))
+' "$out"
+}
+
 cmd_totp() {
   _require_cli || { _err "pass-cli not installed"; return 1; }
   local share_id="${1:-}" item_id="${2:-}"
@@ -146,17 +177,37 @@ cmd_totp() {
   "$PASS_CLI" totp generate "$uri" --output json 2>/dev/null || { _err "failed to generate TOTP"; return 1; }
 }
 
-# Lock/unlock require a real TTY (pass-cli reads the code from /dev/tty) —
-# these exist for completeness/scripted callers but the widget itself drives
-# lock/unlock through a floating terminal, not through these.
-cmd_lock() {
+cmd_logout() {
   _require_cli || { _err "pass-cli not installed"; return 1; }
-  "$PASS_CLI" session lock 2>&1
+  "$PASS_CLI" logout >/dev/null 2>&1
+  printf '{"ok":true}\n'
 }
 
+cmd_lock() {
+  _require_cli || { _err "pass-cli not installed"; return 1; }
+  "$PASS_CLI" session lock >/dev/null 2>&1
+  printf '{"ok":true}\n'
+}
+
+# Code arrives on our own stdin (one line) and is relayed to the tty helper's
+# stdin unchanged — never touches argv, a file, or a log at any hop.
 cmd_unlock() {
   _require_cli || { _err "pass-cli not installed"; return 1; }
-  "$PASS_CLI" session unlock 2>&1
+  [ -x "$TTY_HELPER" ] || { _err "tty helper not installed"; return 1; }
+  python3 "$TTY_HELPER" unlock
+}
+
+cmd_create_lock() {
+  _require_cli || { _err "pass-cli not installed"; return 1; }
+  [ -x "$TTY_HELPER" ] || { _err "tty helper not installed"; return 1; }
+  local idle_timeout="${1:-300}"
+  python3 "$TTY_HELPER" create-lock "$idle_timeout"
+}
+
+cmd_remove_lock() {
+  _require_cli || { _err "pass-cli not installed"; return 1; }
+  [ -x "$TTY_HELPER" ] || { _err "tty helper not installed"; return 1; }
+  python3 "$TTY_HELPER" remove-lock
 }
 
 main() {
@@ -167,9 +218,13 @@ main() {
     vaults) cmd_vaults "$@" ;;
     items) cmd_items "$@" ;;
     view) cmd_view "$@" ;;
+    detail) cmd_detail "$@" ;;
     totp) cmd_totp "$@" ;;
+    logout) cmd_logout "$@" ;;
     lock) cmd_lock "$@" ;;
     unlock) cmd_unlock "$@" ;;
+    create-lock) cmd_create_lock "$@" ;;
+    remove-lock) cmd_remove_lock "$@" ;;
     *)
       _err "unknown subcommand: $subcmd"
       return 1

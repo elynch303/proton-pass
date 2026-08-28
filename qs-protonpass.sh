@@ -19,6 +19,14 @@ PASS_CLI="${QS_PROTONPASS_CLI:-pass-cli}"
 TTY_HELPER="${QS_PROTONPASS_TTY_HELPER:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/qs-protonpass-tty.py}"
 [ -x "$TTY_HELPER" ] || TTY_HELPER="$HOME/.local/bin/qs-protonpass-tty.py"
 
+# Producer-side ceilings: every pass-cli call below is wrapped in `timeout`
+# and every captured response is capped with `head -c` before it reaches a
+# shell var (and from there Python/QML). A hung pass-cli or a pathological
+# response otherwise blocks the widget indefinitely or gets handed to QML's
+# Repeaters uncapped.
+CLI_TIMEOUT="${QS_PROTONPASS_CLI_TIMEOUT:-10}"
+MAX_OUT_BYTES=1048576
+
 _err() {
   python3 -c 'import json,sys; print(json.dumps({"error": sys.argv[1]}))' "$1"
 }
@@ -33,21 +41,24 @@ cmd_status() {
     return 0
   fi
   local out
-  if out="$("$PASS_CLI" info --output json 2>&1)"; then
-    local has_lock idle_timeout
+  if out="$(timeout "$CLI_TIMEOUT" "$PASS_CLI" info --output json 2>&1 | head -c "$MAX_OUT_BYTES")"; then
+    local has_lock idle_timeout locked
     has_lock="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_has_lock", False))' 2>/dev/null)"
-    if [ "$has_lock" = "True" ]; then
-      idle_timeout="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_lock_after_seconds", ""))' 2>/dev/null)"
-      # session_has_lock only tells us a lock exists, not whether it's
-      # currently engaged; a locked session fails ordinary calls like
-      # `vault list` below, which is what actually distinguishes the two.
-      if "$PASS_CLI" vault list --output json >/dev/null 2>&1; then
+    idle_timeout=""
+    [ "$has_lock" = "True" ] && idle_timeout="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_lock_after_seconds", ""))' 2>/dev/null)"
+    # `info`'s session_has_lock only reflects whether a lock is configured,
+    # and has been observed out of sync with the session's real lock state
+    # (reporting false while the session was actually SessionLocked) — so
+    # the real state always comes from attempting an authenticated call,
+    # never from trusting that field alone.
+    if timeout "$CLI_TIMEOUT" "$PASS_CLI" vault list --output json >/dev/null 2>&1; then
+      if [ "$has_lock" = "True" ]; then
         printf '{"state":"unlocked","hasLock":true,"idleTimeout":%s}\n' "${idle_timeout:-null}"
       else
-        printf '{"state":"locked"}\n'
+        printf '{"state":"unlocked","hasLock":false}\n'
       fi
     else
-      printf '{"state":"unlocked","hasLock":false}\n'
+      printf '{"state":"locked"}\n'
     fi
     return 0
   fi
@@ -60,7 +71,7 @@ cmd_status() {
 
 cmd_vaults() {
   _require_cli || { _err "pass-cli not installed"; return 1; }
-  "$PASS_CLI" vault list --output json 2>/dev/null || { _err "failed to list vaults"; return 1; }
+  timeout "$CLI_TIMEOUT" "$PASS_CLI" vault list --output json 2>/dev/null | head -c "$MAX_OUT_BYTES" || { _err "failed to list vaults"; return 1; }
 }
 
 # Item metadata only (title, type, vault, timestamps) — never secrets.
@@ -74,36 +85,47 @@ cmd_items() {
   fi
 
   if [ -n "$vault_share_id" ]; then
-    "$PASS_CLI" item list --share-id "$vault_share_id" --output json 2>/dev/null || { _err "failed to list items"; return 1; }
+    timeout "$CLI_TIMEOUT" "$PASS_CLI" item list --share-id "$vault_share_id" --output json 2>/dev/null | head -c "$MAX_OUT_BYTES" || { _err "failed to list items"; return 1; }
     return 0
   fi
 
   local vaults_json
-  vaults_json="$("$PASS_CLI" vault list --output json 2>/dev/null)" || { _err "failed to list vaults"; return 1; }
+  vaults_json="$(timeout "$CLI_TIMEOUT" "$PASS_CLI" vault list --output json 2>/dev/null | head -c "$MAX_OUT_BYTES")" || { _err "failed to list vaults"; return 1; }
 
-  python3 -c '
+  # vaults_json arrives on stdin, not argv (same reasoning as cmd_view/
+  # cmd_detail) — vault names could in principle be long/adversarial too.
+  # Per-vault fetch is capped (byte + count) so one oversized or malicious
+  # vault can't blow up memory or the list handed to QML's Repeater; a
+  # rejected vault is skipped exactly like an error from pass-cli itself.
+  printf '%s' "$vaults_json" | python3 -c '
 import json, sys, subprocess
 
-vaults = json.loads(sys.argv[1]).get("vaults", [])
-pass_cli = sys.argv[2]
+MAX_BYTES = 1024 * 1024
+MAX_ITEMS_PER_VAULT = 5000
+MAX_TOTAL_ITEMS = 20000
+
+vaults = json.loads(sys.stdin.read()).get("vaults", [])
+pass_cli = sys.argv[1]
 all_items = []
 for v in vaults:
+    if len(all_items) >= MAX_TOTAL_ITEMS:
+        break
     share_id = v.get("share_id")
     try:
         out = subprocess.run(
             [pass_cli, "item", "list", "--share-id", share_id, "--output", "json"],
             capture_output=True, text=True, timeout=15,
         )
-        if out.returncode != 0:
+        if out.returncode != 0 or len(out.stdout.encode()) > MAX_BYTES:
             continue
-        items = json.loads(out.stdout).get("items", [])
+        items = json.loads(out.stdout).get("items", [])[:MAX_ITEMS_PER_VAULT]
         for it in items:
             it["vault_name"] = v.get("name")
         all_items.extend(items)
     except Exception:
         continue
-print(json.dumps({"items": all_items}))
-' "$vaults_json" "$PASS_CLI" || { _err "failed to merge items"; return 1; }
+print(json.dumps({"items": all_items[:MAX_TOTAL_ITEMS]}))
+' "$PASS_CLI" || { _err "failed to merge items"; return 1; }
 }
 
 # Single secret field, for a one-shot clipboard copy. Never persisted.
@@ -116,19 +138,23 @@ cmd_view() {
   fi
 
   local out
-  out="$("$PASS_CLI" item view --share-id "$share_id" --item-id "$item_id" --output json 2>/dev/null)" || { _err "failed to view item"; return 1; }
+  out="$(timeout "$CLI_TIMEOUT" "$PASS_CLI" item view --share-id "$share_id" --item-id "$item_id" --output json 2>/dev/null | head -c "$MAX_OUT_BYTES")" || { _err "failed to view item"; return 1; }
 
-  python3 -c '
+  # The full item JSON (password, TOTP URI, notes, ...) goes in on stdin,
+  # never argv — argv is visible to any local process via /proc/*/cmdline
+  # or `ps`, and this object carries secrets even though only one field
+  # is ever selected back out.
+  printf '%s' "$out" | python3 -c '
 import json, sys
-d = json.loads(sys.argv[1])
-field = sys.argv[2]
+d = json.loads(sys.stdin.read())
+field = sys.argv[1]
 login = d.get("item", {}).get("content", {}).get("content", {}).get("Login", {})
 val = login.get(field)
 if val is None:
     print(json.dumps({"error": f"field not found: {field}"}))
     sys.exit(1)
 print(json.dumps({"value": val}))
-' "$out" "$field"
+' "$field"
 }
 
 # Non-secret detail-view fields in one call (username, urls, timestamps) —
@@ -143,19 +169,22 @@ cmd_detail() {
   fi
 
   local out
-  out="$("$PASS_CLI" item view --share-id "$share_id" --item-id "$item_id" --output json 2>/dev/null)" || { _err "failed to view item"; return 1; }
+  out="$(timeout "$CLI_TIMEOUT" "$PASS_CLI" item view --share-id "$share_id" --item-id "$item_id" --output json 2>/dev/null | head -c "$MAX_OUT_BYTES")" || { _err "failed to view item"; return 1; }
 
-  python3 -c '
+  # Same stdin-not-argv reasoning as cmd_view: this JSON still carries the
+  # password/TOTP even though only non-secret fields are read back out.
+  printf '%s' "$out" | python3 -c '
 import json, sys
-d = json.loads(sys.argv[1])
+d = json.loads(sys.stdin.read())
 item = d.get("item", {})
 login = item.get("content", {}).get("content", {}).get("Login", {})
 print(json.dumps({
     "username": login.get("username", ""),
-    "urls": login.get("urls", []) or [],
+    "email": login.get("email", ""),
+    "urls": (login.get("urls", []) or [])[:20],
     "modify_time": item.get("modify_time"),
 }))
-' "$out"
+'
 }
 
 cmd_totp() {
@@ -167,14 +196,106 @@ cmd_totp() {
   fi
 
   local out uri
-  out="$("$PASS_CLI" item view --share-id "$share_id" --item-id "$item_id" --output json 2>/dev/null)" || { _err "failed to view item"; return 1; }
+  out="$(timeout "$CLI_TIMEOUT" "$PASS_CLI" item view --share-id "$share_id" --item-id "$item_id" --output json 2>/dev/null | head -c "$MAX_OUT_BYTES")" || { _err "failed to view item"; return 1; }
   uri="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("item",{}).get("content",{}).get("content",{}).get("Login",{}).get("totp_uri",""))')"
   if [ -z "$uri" ]; then
     _err "no TOTP configured for this item"
     return 1
   fi
 
-  "$PASS_CLI" totp generate "$uri" --output json 2>/dev/null || { _err "failed to generate TOTP"; return 1; }
+  # NOTE: pass-cli's own `totp generate` CLI only accepts the secret/URI
+  # (TOTP seed included) as a positional argument — it has no stdin mode
+  # (confirmed against `pass-cli totp generate --help`) — so this one argv
+  # exposure is a pass-cli limitation, not something this wrapper can close.
+  # It's minimized to a single short-lived call, right after fetch, never
+  # logged or retained.
+  timeout "$CLI_TIMEOUT" "$PASS_CLI" totp generate "$uri" --output json 2>/dev/null | head -c "$MAX_OUT_BYTES" || { _err "failed to generate TOTP"; return 1; }
+}
+
+# Direct-fetch favicon for an item's guessed domain (never a third-party
+# proxy - this is the only network call in the plugin that isn't pass-cli
+# itself, so it stays limited to https://DOMAIN/favicon.ico). Favicons
+# aren't secret, so unlike everything else here they're cached to disk
+# (~/.cache/proton-pass/favicons), including a `.miss` sentinel for domains
+# with no favicon so a dead site isn't re-fetched on every popup open.
+cmd_favicon() {
+  local domain="${1:-}"
+  if [ -z "$domain" ]; then
+    _err "usage: favicon DOMAIN"
+    return 1
+  fi
+  case "$domain" in
+    */*|*'..'*|'') _err "invalid domain"; return 1 ;;
+  esac
+
+  local cache_dir="$HOME/.cache/proton-pass/favicons"
+  mkdir -p "$cache_dir"
+  local safe existing tmp mime ext dest
+  safe="$(printf '%s' "$domain" | tr -c 'a-zA-Z0-9.-' '_')"
+
+  if [ -e "$cache_dir/$safe.miss" ]; then
+    _err "no favicon for $domain (cached miss)"
+    return 1
+  fi
+  existing="$(command ls "$cache_dir/$safe".* 2>/dev/null | head -n1)"
+  if [ -n "$existing" ] && [ -s "$existing" ]; then
+    python3 -c 'import json,sys; print(json.dumps({"ok": True, "path": sys.argv[1]}))' "$existing"
+    return 0
+  fi
+
+  # SSRF guard: `domain` is guessed from a vault item's title, and in a
+  # shared vault that title is data another Proton Pass user chose — not
+  # fully trusted input. The domain-shape regex upstream in the widget lets
+  # through IP-literal and internal-hostname titles too (confirmed:
+  # "169.254.169.254", "192.168.1.1", "router.local" all match), which
+  # would otherwise trigger an automatic, no-click curl to an internal or
+  # cloud-metadata address on every popup open. Resolve first and reject
+  # anything that isn't a public address, then pin curl to exactly the
+  # address just validated (`--resolve`) so a second, later DNS resolution
+  # — which could differ (DNS rebinding) — can't slip past the check.
+  local safe_ip
+  safe_ip="$(python3 -c '
+import ipaddress, socket, sys
+domain = sys.argv[1]
+try:
+    infos = socket.getaddrinfo(domain, 443, proto=socket.IPPROTO_TCP)
+except OSError:
+    sys.exit(1)
+for info in infos:
+    addr = ipaddress.ip_address(info[4][0])
+    if addr.is_global and not addr.is_multicast:
+        print(addr)
+        sys.exit(0)
+sys.exit(1)
+' "$domain" 2>/dev/null)" || {
+    touch "$cache_dir/$safe.miss"
+    _err "no favicon for $domain (unresolvable or non-public address)"
+    return 1
+  }
+
+  tmp="$cache_dir/$safe.tmp"
+  if ! curl -fsSL --max-time 3 --resolve "$domain:443:$safe_ip" -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" "https://$domain/favicon.ico" -o "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+    rm -f "$tmp"
+    touch "$cache_dir/$safe.miss"
+    _err "no favicon for $domain"
+    return 1
+  fi
+
+  mime="$(file -b --mime-type "$tmp" 2>/dev/null)"
+  case "$mime" in
+    image/x-icon|image/vnd.microsoft.icon) ext="ico" ;;
+    image/png) ext="png" ;;
+    image/gif) ext="gif" ;;
+    image/jpeg) ext="jpg" ;;
+    image/svg+xml) ext="svg" ;;
+    image/webp) ext="webp" ;;
+    image/bmp) ext="bmp" ;;
+    *) rm -f "$tmp"; touch "$cache_dir/$safe.miss"; _err "unsupported favicon type: $mime"; return 1 ;;
+  esac
+
+  dest="$cache_dir/$safe.$ext"
+  mv "$tmp" "$dest"
+  python3 -c 'import json,sys; print(json.dumps({"ok": True, "path": sys.argv[1]}))' "$dest"
 }
 
 cmd_logout() {
@@ -219,6 +340,7 @@ main() {
     items) cmd_items "$@" ;;
     view) cmd_view "$@" ;;
     detail) cmd_detail "$@" ;;
+    favicon) cmd_favicon "$@" ;;
     totp) cmd_totp "$@" ;;
     logout) cmd_logout "$@" ;;
     lock) cmd_lock "$@" ;;

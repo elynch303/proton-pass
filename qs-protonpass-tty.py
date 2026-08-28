@@ -14,10 +14,42 @@ import json
 import os
 import pty
 import select
+import signal
 import sys
 import time
 
 PASS_CLI = os.environ.get("QS_PROTONPASS_CLI", "pass-cli")
+
+# Ceiling on the transcript we accumulate from the pty. This is terminal
+# output (prompts, echoed control sequences), not the code itself — rpassword
+# on the pass-cli side disables local echo for the actual secret entry — but
+# it's still unbounded attacker/hang-controlled data otherwise, and a hung
+# pass-cli could be made to emit forever.
+MAX_TRANSCRIPT_BYTES = 8192
+
+
+def _reap(pid):
+    """Kill the child (and anything it spawned into the same pty session)
+    and block until it's actually gone — never leaves a hung/zombie pass-cli
+    behind on timeout."""
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                wpid, _ = os.waitpid(pid, os.WNOHANG)
+                if wpid == pid:
+                    return
+                time.sleep(0.05)
+        except ChildProcessError:
+            return
 
 
 def run_with_pty(argv, responses, timeout=10):
@@ -27,6 +59,7 @@ def run_with_pty(argv, responses, timeout=10):
     out = b""
     start = time.time()
     idx = 0
+    timed_out = False
     while time.time() - start < timeout:
         r, _, _ = select.select([fd], [], [], 0.3)
         if fd in r:
@@ -36,18 +69,19 @@ def run_with_pty(argv, responses, timeout=10):
                 break
             if not chunk:
                 break
-            out += chunk
+            if len(out) < MAX_TRANSCRIPT_BYTES:
+                out += chunk[: MAX_TRANSCRIPT_BYTES - len(out)]
             while idx < len(responses) and responses[idx][0].encode() in out:
                 os.write(fd, responses[idx][1].encode())
                 idx += 1
         if not os.path.exists(f"/proc/{pid}"):
             time.sleep(0.2)
             break
-    try:
-        os.waitpid(pid, os.WNOHANG)
-    except OSError:
-        pass
-    return out.decode(errors="replace")
+    else:
+        timed_out = True
+
+    _reap(pid)
+    return out.decode(errors="replace"), timed_out
 
 
 def result(ok, error=None):
@@ -81,8 +115,14 @@ def main():
         result(False, f"unknown action: {action}")
         return
 
-    out = run_with_pty(argv, responses)
+    out, timed_out = run_with_pty(argv, responses)
 
+    if timed_out:
+        # Fixed message, not the raw transcript — on timeout we can't be
+        # sure what's in `out` (a prompt pass-cli was mid-writing, a partial
+        # echo, ...), so nothing pty-derived leaves this process here.
+        result(False, "timed out waiting for pass-cli")
+        return
     if "SessionLocked" in out or "session_locked" in out.lower():
         result(False, "wrong code")
         return

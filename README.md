@@ -18,7 +18,10 @@ by the official [`pass-cli`](https://proton.me/pass), not a reimplementation.
   from the popup, then unlock with a 6-box PIN entry — no floating terminal
   needed for day-to-day lock/unlock
 - Login still opens a floating terminal, since it's a one-time interactive
-  web-login/2FA flow
+  web-login/2FA flow — the login URL opens in your browser automatically
+  the moment pass-cli prints it, no copy-pasting needed
+- Per-item favicons for logins titled by domain (most autosaved logins are),
+  fetched directly from the site itself — see "How it works" below
 - No secret values are ever written to disk by this plugin — everything is
   fetched from `pass-cli` on demand
 
@@ -30,6 +33,8 @@ by the official [`pass-cli`](https://proton.me/pass), not a reimplementation.
 - You must have run `pass-cli login` at least once before the widget will
   show anything beyond a "log in" prompt
 - `wl-copy` / `wl-clipboard` for the clipboard-copy actions
+- `curl` and `file` for per-item favicons (both are near-universal on Linux;
+  favicons just silently stay off without them)
 
 ## Installation
 
@@ -69,6 +74,22 @@ process's argv and is never written to disk. The idle timeout you choose at
 setup is `pass-cli`'s own — nothing here is hardcoded or read from any
 browser extension.
 
+Login works the same way (`pass-cli login` also needs a real TTY),
+via `qs-protonpass-login.py`: it relays `pass-cli login` through a pty
+transparently into the floating terminal, so it looks and behaves exactly
+like running the command yourself, while also watching the relayed output
+for the login URL and opening it in your default browser (`xdg-open`) the
+moment it appears.
+
+`pass-cli item list` doesn't return URLs (only `item view`/`detail` does,
+which is too costly to call for every row), so favicons are guessed from
+the item's title: if a login is titled by bare domain (e.g. "aircanada.com",
+which is what most browser-autosaved logins end up titled), the widget
+fetches `https://<that domain>/favicon.ico` directly and caches the result
+to `~/.cache/proton-pass/favicons` — hits and misses both, so a cold vault
+only pays the network cost once. Titles that aren't domain-shaped just keep
+the existing colored-letter avatar; no fetch is attempted for those.
+
 ## Security notes
 
 - Clipboard-copy model, not autofill — nothing is typed into other windows
@@ -76,7 +97,12 @@ browser extension.
   immediately if the popup is closed early
 - Item search/list only ever fetches metadata (title, type, vault); actual
   secret values are fetched one field at a time, only when you click copy
-- Nothing from a vault is cached to `~/.cache` or anywhere else on disk
+- No vault secret is ever cached to `~/.cache` or anywhere else on disk.
+  The one exception is favicons: item titles that look like a domain are
+  used to fetch and cache `https://<domain>/favicon.ico` directly from that
+  site — never through a third-party favicon proxy — so those domain names
+  (not any vault content) are visible to the sites themselves and cached
+  locally as plain image files
 - Your PIN never appears in process argv and is never written to disk —
   see "How it works" above
 
@@ -84,12 +110,13 @@ browser extension.
 
 ```
 omarchy plugin remove io.github.elynch303.proton-pass
-rm -f ~/.local/bin/qs-protonpass.sh ~/.local/bin/qs-protonpass-tty.py
+rm -f ~/.local/bin/qs-protonpass.sh ~/.local/bin/qs-protonpass-tty.py ~/.local/bin/qs-protonpass-copy.py ~/.local/bin/qs-protonpass-login.py
+rm -rf ~/.cache/proton-pass
 ```
 
 Then remove its entry from `~/.config/omarchy/shell.json` if you added one.
-This plugin never wrote anything to `~/.cache` or elsewhere on disk, so
-there's no other state to clean up.
+The favicon cache above is the only thing this plugin ever writes to disk —
+no vault secret is ever written anywhere.
 
 ## License
 

@@ -20,16 +20,22 @@ import qs.Ui
 //
 // Clipboard: secret values flow from qs-protonpass.sh's stdout into a QML
 // var that's never bound to any visible Text element, then out via
-// Util.execDetached (printf | wl-copy) — the same pattern the network
-// panel uses for the wifi passphrase and tailscale use for peer info.
-// A Quickshell-managed Process can't be used for the wl-copy leg: wl-copy
-// only claims the selection once its stdin hits EOF, and QML's Process
-// exposes write() but no way to close/EOF the pipe, so it just hangs
-// forever and nothing actually reaches the clipboard (confirmed with a
-// manual fifo test). execDetached's child process tree closes stdin
-// naturally when printf exits, so wl-copy backgrounds itself correctly.
+// qs-protonpass-copy.py — a fixed-argv helper invoked as a managed Process,
+// fed the secret as one JSON line on stdin (never argv, never a shell
+// command string with the secret spliced into it — see that script's
+// header for the full reasoning, including how it solves the EOF problem
+// below without needing to close this Process's stdin).
+// A Quickshell-managed Process can't run wl-copy directly: wl-copy only
+// claims the selection once its stdin hits EOF, and QML's Process exposes
+// write() but no way to close/EOF the pipe, so it just hangs forever and
+// nothing actually reaches the clipboard (confirmed with a manual fifo
+// test). The helper process opens its own separate pipe to wl-copy and
+// closes that one itself, so wl-copy still gets a real EOF.
 // The clipboard is cleared automatically after ~35s or immediately if the
-// popup closes.
+// popup closes — by terminating the specific wl-copy process this plugin
+// started (tracked by pid, --foreground so it never forks away), and only
+// if it's still alive and still wl-copy, never a blind clipboard clear
+// that could erase something unrelated the user copied since.
 BarWidget {
   id: root
   moduleName: "local.proton-pass"
@@ -176,23 +182,71 @@ BarWidget {
 
   onSelectedVaultIdChanged: if (detail.open && root.sessionState === "unlocked") root.refreshVaultsAndItems()
 
-  // ── clipboard: detached printf|wl-copy, never a managed Process (see header) ──
-  function copyToClipboard(secret) {
-    Util.execDetached("printf %s " + Util.shellQuote(secret) + " | wl-copy")
+  // ── clipboard: fixed-argv helper over stdin, tracked pid for an
+  // ownership-safe clear (see qs-protonpass-copy.py's header for the full
+  // reasoning) — never a shell string with the secret in it, and never a
+  // blind `wl-copy --clear` that could erase clipboard content the user
+  // put there themselves after the copy. ──────────────────────────────────
+  readonly property string copyHelperScript: home + "/.local/bin/qs-protonpass-copy.py"
+  property int activeCopyPid: 0
+
+  Process {
+    id: copyProc
+    property string pendingSecret: ""
+    command: [root.copyHelperScript]
+    stdinEnabled: true
+    // Same reason unlockPinProc/createLockProc/removeLockProc below write
+    // from onStarted rather than right after toggling `running`: the
+    // process isn't necessarily started yet at that point, so a write()
+    // issued immediately after `running = true` can race and get silently
+    // dropped — confirmed against how this file already handles PIN
+    // delivery, which is the proven-working pattern here.
+    onStarted: { write(pendingSecret); pendingSecret = "" }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var d = JSON.parse(text)
+          root.activeCopyPid = (d.ok && d.pid) ? d.pid : 0
+        } catch (e) {
+          root.activeCopyPid = 0
+        }
+      }
+    }
   }
+  function copyToClipboard(secret) {
+    copyProc.pendingSecret = JSON.stringify({ value: secret }) + "\n"
+    copyProc.running = false
+    copyProc.running = true
+  }
+
   Process {
     id: clipboardClearProc
-    command: ["wl-copy", "--clear"]
+  }
+  function ownershipSafeClear() {
+    var pid = root.activeCopyPid
+    root.activeCopyPid = 0
+    if (!pid) return
+    // Only acts if `pid` is still alive and is still literally wl-copy. If
+    // the user copied something else in the meantime, wl-clipboard's own
+    // model means our wl-copy already exited when the new owner claimed
+    // the selection — so this is a no-op and nothing unrelated is touched.
+    // wl-copy clears the selection itself on SIGTERM before exiting.
+    clipboardClearProc.command = ["bash", "-c",
+      'p="$1"; [ "$(cat /proc/"$p"/comm 2>/dev/null)" = "wl-copy" ] && kill -TERM "$p"',
+      "bash", String(pid)]
+    clipboardClearProc.running = false
+    clipboardClearProc.running = true
   }
   Timer {
     id: clipboardClearTimer
     interval: 35000
     repeat: false
-    onTriggered: { clipboardClearProc.running = false; clipboardClearProc.running = true; root.copyFeedback = "" }
+    onTriggered: { root.ownershipSafeClear(); root.copyFeedback = "" }
   }
   function clearClipboardNow() {
     clipboardClearTimer.stop()
-    clipboardClearProc.running = false; clipboardClearProc.running = true
+    root.ownershipSafeClear()
   }
 
   Process {
@@ -254,7 +308,13 @@ BarWidget {
   // 626-item vault). Opening an item's detail view is a single per-item
   // `view` call, same cost as one copy — that's what makes a real username
   // subtitle affordable here where it wasn't for every row in the list.
+  // Proton Pass logins can carry the identifier in either `username` or
+  // `email` (autosaved logins from a browser often only fill `email`,
+  // leaving `username` blank) - prefer whichever is actually set and copy
+  // from that same field, labeling the row to match.
   property string detailUsername: ""
+  property string detailIdentifierField: "username"
+  property string detailIdentifierLabel: "Username"
   property var detailUrls: []
   property string detailModified: ""
   property bool detailUsernameLoading: false
@@ -271,6 +331,8 @@ BarWidget {
   onExpandedKeyChanged: {
     root.hideReveal()
     root.detailUsername = ""
+    root.detailIdentifierField = "username"
+    root.detailIdentifierLabel = "Username"
     root.detailUrls = []
     root.detailModified = ""
     root.detailUsernameLoading = false
@@ -290,11 +352,27 @@ BarWidget {
         root.detailUsernameLoading = false
         try {
           var d = JSON.parse(text)
-          root.detailUsername = d.username || ""
+          var uname = d.username || ""
+          var email = d.email || ""
+          if (uname) {
+            root.detailUsername = uname
+            root.detailIdentifierField = "username"
+            root.detailIdentifierLabel = "Username"
+          } else if (email) {
+            root.detailUsername = email
+            root.detailIdentifierField = "email"
+            root.detailIdentifierLabel = "Email"
+          } else {
+            root.detailUsername = ""
+            root.detailIdentifierField = "username"
+            root.detailIdentifierLabel = "Username"
+          }
           root.detailUrls = d.urls || []
           root.detailModified = d.modify_time || ""
         } catch (e) {
           root.detailUsername = ""
+          root.detailIdentifierField = "username"
+          root.detailIdentifierLabel = "Username"
           root.detailUrls = []
           root.detailModified = ""
         }
@@ -352,9 +430,18 @@ BarWidget {
   // code is written once to the Process's stdin and read with a line read
   // on the far end, not a wl-copy-style EOF claim, so a plain write() here
   // is sufficient (unlike the clipboard case documented above).
+  //
+  // The terminal runs qs-protonpass-login.py, not `pass-cli login`
+  // directly: same real-TTY requirement as above, but that script also
+  // relays pass-cli's own output through a pty transparently (so this still
+  // looks and behaves exactly like running `pass-cli login` yourself) while
+  // scanning it for the login URL and opening it in the browser
+  // automatically — see that script's header for why this is more reliable
+  // than counting on pass-cli's own internal browser-open attempt alone.
+  readonly property string loginHelperScript: home + "/.local/bin/qs-protonpass-login.py"
   Process {
     id: loginProc
-    command: ["omarchy-launch-floating-terminal-with-presentation", "pass-cli login"]
+    command: ["omarchy-launch-floating-terminal-with-presentation", root.loginHelperScript]
   }
   function launchLogin() { loginProc.running = false; loginProc.running = true }
 
@@ -514,6 +601,81 @@ BarWidget {
     var c = title && title.length ? title.charCodeAt(0) : 0
     return palette[c % palette.length]
   }
+
+  // ── per-item favicons, guessed from the title ───────────────────────────
+  // pass-cli's item list doesn't include URLs (only `detail` does, and
+  // that's one call per item - too costly for every row). Most Proton Pass
+  // logins are autosaved and titled by domain already (e.g. "aircanada.com"),
+  // so a title that looks like a bare hostname is a free stand-in for the
+  // real URL. Titles that don't look like a domain just keep the existing
+  // colored-letter avatar - no fetch is attempted for them.
+  //
+  // qs-protonpass.sh does the actual network fetch (direct to the domain's
+  // own favicon.ico, never a third-party proxy) and caches the result to
+  // disk, including a miss sentinel - so once warm, showing a row again is
+  // a local file read with zero network calls, zero process spawns.
+  property var faviconPaths: ({})     // domain -> cached file path, once known
+  property var faviconFailed: ({})    // domain -> true, this session's known misses
+  property var faviconQueue: []
+  property int faviconActive: 0
+  readonly property int faviconMaxConcurrent: 6
+  readonly property var domainPattern: /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/
+
+  function domainForTitle(title) {
+    if (!title) return ""
+    var t = String(title).trim().toLowerCase()
+    if (t.indexOf(" ") !== -1 || t.indexOf("@") !== -1) return ""
+    return root.domainPattern.test(t) ? t : ""
+  }
+
+  function queueFaviconFetch(domain) {
+    if (!domain || root.faviconPaths[domain] || root.faviconFailed[domain]) return
+    if (root.faviconQueue.indexOf(domain) !== -1) return
+    root.faviconQueue.push(domain)
+    root.pumpFaviconQueue()
+  }
+
+  function pumpFaviconQueue() {
+    while (root.faviconActive < root.faviconMaxConcurrent && root.faviconQueue.length > 0) {
+      var domain = root.faviconQueue.shift()
+      root.faviconActive++
+      var proc = faviconProcComponent.createObject(root, { domain: domain })
+      proc.command = [root.wrapperScript, "favicon", domain]
+      proc.running = true
+    }
+  }
+
+  Component {
+    id: faviconProcComponent
+    Process {
+      id: proc
+      property string domain: ""
+      stdout: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: {
+          try {
+            var d = JSON.parse(text)
+            if (d.ok && d.path) {
+              var m = root.faviconPaths
+              m[proc.domain] = d.path
+              root.faviconPaths = Object.assign({}, m)
+            } else {
+              var f = root.faviconFailed
+              f[proc.domain] = true
+              root.faviconFailed = Object.assign({}, f)
+            }
+          } catch (e) {
+            var f2 = root.faviconFailed
+            f2[proc.domain] = true
+            root.faviconFailed = Object.assign({}, f2)
+          }
+          root.faviconActive--
+          root.pumpFaviconQueue()
+          Qt.callLater(function() { proc.destroy() })
+        }
+      }
+    }
+  }
   function tooltipText() {
     if (root.sessionState === "missing") return "Proton Pass not set up\nClick for setup notes"
     if (root.sessionState === "logged-out") return "Not logged in\nClick to log in"
@@ -589,6 +751,7 @@ BarWidget {
     owner: root
     contentWidth: Style.space(320)
     contentHeight: bodyCol.implicitHeight + padding * 2
+    borderSpec: Border.flat(Color.accent, Math.max(2, Style.space(2)))
     focusTarget: root.sessionState === "locked" ? pinUnlockBoxes
       : (root.sessionState === "unlocked" && root.lockSetupStage !== "") ? pinSetupBoxes
       : (root.sessionState === "unlocked") ? searchField
@@ -660,16 +823,28 @@ BarWidget {
         }
         return s
       }
+      // Deferred via Qt.callLater, same as clear() below already did: moving
+      // Qt's active-focus item to a sibling TextInput synchronously, from
+      // inside the very key-event handling that's still in progress (typing
+      // a digit auto-advances to the next box), can race the Wayland
+      // text-input-v3 enable/disable handshake that has to happen on every
+      // focus change — the symptom is keystrokes silently going nowhere
+      // until something else (e.g. a NumLock toggle) forces a fresh
+      // modifier event through and un-wedges it. Letting the current event
+      // finish first, on the next loop tick, avoids the race instead of
+      // relying on an unrelated event to paper over it.
       function focusIndex(i) {
-        var it = pinRepeater.itemAt(i)
-        if (it) it.textInput.forceActiveFocus()
+        Qt.callLater(function() {
+          var it = pinRepeater.itemAt(i)
+          if (it) it.textInput.forceActiveFocus()
+        })
       }
       function clear() {
         for (var i = 0; i < pinRepeater.count; i++) {
           var it = pinRepeater.itemAt(i)
           if (it) it.textInput.text = ""
         }
-        Qt.callLater(function() { pinBoxes.focusIndex(0) })
+        pinBoxes.focusIndex(0)
       }
 
       Row {
@@ -764,6 +939,13 @@ BarWidget {
         Text {
           width: parent.width
           text: fr.loading ? "Loading…" : (fr.secretField ? (fr.revealed ? fr.revealedText : "••••••••••") : fr.plainValue)
+          // Vault-controlled content (username/email/URL, and the revealed
+          // password/TOTP itself) — never interpret it as rich text/HTML.
+          // Text.AutoText's default markup auto-detection could otherwise
+          // misrender a value from a shared vault item that happens to
+          // look like a tag as styled/linked content instead of literal
+          // text.
+          textFormat: Text.PlainText
           color: Color.popups.text
           font.family: Style.font.family
           font.pixelSize: Style.font.body
@@ -800,9 +982,19 @@ BarWidget {
 
       Item {
         width: parent.width
-        height: Style.spacing.xxl
-        Text {
+        height: Style.spacing.controlHeight
+        Image {
+          id: headerIcon
           anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          source: "icon.svg"
+          sourceSize.width: Style.space(20)
+          sourceSize.height: Style.space(20)
+          fillMode: Image.PreserveAspectFit
+        }
+        Text {
+          anchors.left: headerIcon.right
+          anchors.leftMargin: Style.spacing.sm
           anchors.verticalCenter: parent.verticalCenter
           text: "Proton Pass"
           color: Color.popups.text
@@ -810,14 +1002,28 @@ BarWidget {
           font.pixelSize: Style.font.subtitle
           font.bold: true
         }
-        PanelActionButton {
+        Row {
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
-          visible: root.sessionState === "unlocked"
-          iconText: "󰑐"
-          foreground: Color.popups.text
-          tooltipText: "Refresh"
-          onClicked: root.refreshVaultsAndItems()
+          spacing: Style.spacing.xs
+          // Compact vault chip, like the extension's own header selector —
+          // only meaningful in the browsing list, not mid-detail or mid-setup.
+          SearchableDropdown {
+            visible: root.sessionState === "unlocked" && root.expandedKey === "" && root.lockSetupStage === ""
+            width: Style.space(112)
+            showLabel: false
+            options: root.vaults
+            value: root.selectedVaultId
+            placeholderText: "Vaults..."
+            onChanged: function(v) { root.selectedVaultId = v }
+          }
+          PanelActionButton {
+            visible: root.sessionState === "unlocked"
+            iconText: "󰑐"
+            foreground: Color.popups.text
+            tooltipText: "Refresh"
+            onClicked: root.refreshVaultsAndItems()
+          }
         }
       }
 
@@ -1066,15 +1272,6 @@ BarWidget {
           }
         }
 
-        SearchableDropdown {
-          width: parent.width
-          showLabel: false
-          options: root.vaults
-          value: root.selectedVaultId
-          placeholderText: "Search vaults..."
-          onChanged: function(v) { root.selectedVaultId = v }
-        }
-
         Item {
           width: parent.width
           height: searchField.implicitHeight
@@ -1134,6 +1331,8 @@ BarWidget {
                 id: rowCol
                 required property var modelData
                 readonly property string key: root.itemKey(modelData)
+                readonly property string domain: root.domainForTitle(modelData.title)
+                readonly property string faviconPath: rowCol.domain ? (root.faviconPaths[rowCol.domain] || "") : ""
                 width: itemsCol.width
                 height: Style.space(44)
                 radius: Style.cornerRadius
@@ -1142,8 +1341,11 @@ BarWidget {
                   : "transparent"
                 Behavior on color { ColorAnimation { duration: 100 } }
 
+                Component.onCompleted: if (rowCol.domain) root.queueFaviconFetch(rowCol.domain)
+
                 Rectangle {
                   id: avatar
+                  visible: rowCol.faviconPath === "" || favicon.status !== Image.Ready
                   width: Style.space(28)
                   height: Style.space(28)
                   radius: Style.cornerRadius
@@ -1159,6 +1361,19 @@ BarWidget {
                     font.pixelSize: Style.font.caption
                     font.bold: true
                   }
+                }
+                Image {
+                  id: favicon
+                  visible: status === Image.Ready
+                  width: Style.space(28)
+                  height: Style.space(28)
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.spacing.sm
+                  anchors.verticalCenter: parent.verticalCenter
+                  fillMode: Image.PreserveAspectFit
+                  smooth: true
+                  asynchronous: true
+                  source: rowCol.faviconPath !== "" ? ("file://" + rowCol.faviconPath) : ""
                 }
 
                 Text {
@@ -1183,6 +1398,7 @@ BarWidget {
                   Text {
                     width: parent.width
                     text: rowCol.modelData.title
+                    textFormat: Text.PlainText // vault item title — see FieldRow's Text for why
                     color: Color.popups.text
                     font.family: Style.font.family
                     font.pixelSize: Style.font.body
@@ -1192,6 +1408,7 @@ BarWidget {
                     width: parent.width
                     visible: text !== ""
                     text: rowCol.modelData.vault_name || ""
+                    textFormat: Text.PlainText // vault name — see FieldRow's Text for why
                     color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.45)
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
@@ -1242,6 +1459,9 @@ BarWidget {
           }
           Rectangle {
             id: detailAvatar
+            readonly property string domain: detailCol.item ? root.domainForTitle(detailCol.item.title) : ""
+            readonly property string faviconPath: domain ? (root.faviconPaths[domain] || "") : ""
+            visible: faviconPath === "" || detailFavicon.status !== Image.Ready
             width: Style.space(28)
             height: Style.space(28)
             radius: Style.cornerRadius
@@ -1257,6 +1477,21 @@ BarWidget {
               font.pixelSize: Style.font.caption
               font.bold: true
             }
+            Component.onCompleted: if (detailAvatar.domain) root.queueFaviconFetch(detailAvatar.domain)
+            onDomainChanged: if (detailAvatar.domain) root.queueFaviconFetch(detailAvatar.domain)
+          }
+          Image {
+            id: detailFavicon
+            visible: status === Image.Ready
+            width: Style.space(28)
+            height: Style.space(28)
+            anchors.left: backBtn.right
+            anchors.leftMargin: Style.spacing.sm
+            anchors.verticalCenter: parent.verticalCenter
+            fillMode: Image.PreserveAspectFit
+            smooth: true
+            asynchronous: true
+            source: detailAvatar.faviconPath !== "" ? ("file://" + detailAvatar.faviconPath) : ""
           }
           Column {
             anchors.left: detailAvatar.right
@@ -1267,6 +1502,7 @@ BarWidget {
             Text {
               width: parent.width
               text: detailCol.item ? detailCol.item.title : ""
+              textFormat: Text.PlainText // vault item title — see FieldRow's Text for why
               color: Color.popups.text
               font.family: Style.font.family
               font.pixelSize: Style.font.body
@@ -1277,6 +1513,7 @@ BarWidget {
               width: parent.width
               visible: text !== ""
               text: detailCol.item ? (detailCol.item.vault_name || "") : ""
+              textFormat: Text.PlainText // vault name — see FieldRow's Text for why
               color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.45)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
@@ -1291,10 +1528,10 @@ BarWidget {
           spacing: Style.spacing.xs
 
           FieldRow {
-            label: "Username"
+            label: root.detailIdentifierLabel
             loading: root.detailUsernameLoading
             plainValue: root.detailUsername
-            onCopyRequested: root.copyField(detailCol.item.share_id, detailCol.item.id, "username", "username")
+            onCopyRequested: root.copyField(detailCol.item.share_id, detailCol.item.id, root.detailIdentifierField, root.detailIdentifierLabel.toLowerCase())
           }
           FieldRow {
             label: "Password"
@@ -1340,6 +1577,7 @@ BarWidget {
               var d = new Date(root.detailModified)
               return isNaN(d.getTime()) ? root.detailModified : Qt.formatDateTime(d, "MMM d, yyyy · h:mm AP")
             }
+            textFormat: Text.PlainText // falls back to the raw pass-cli timestamp string if unparseable
             color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.7)
             font.family: Style.font.family
             font.pixelSize: Style.font.caption

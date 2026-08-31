@@ -203,13 +203,46 @@ cmd_totp() {
     return 1
   fi
 
-  # NOTE: pass-cli's own `totp generate` CLI only accepts the secret/URI
-  # (TOTP seed included) as a positional argument — it has no stdin mode
-  # (confirmed against `pass-cli totp generate --help`) — so this one argv
-  # exposure is a pass-cli limitation, not something this wrapper can close.
-  # It's minimized to a single short-lived call, right after fetch, never
-  # logged or retained.
-  timeout "$CLI_TIMEOUT" "$PASS_CLI" totp generate "$uri" --output json 2>/dev/null | head -c "$MAX_OUT_BYTES" || { _err "failed to generate TOTP"; return 1; }
+  # `pass-cli totp generate` only accepts the secret/URI (TOTP seed
+  # included) as a positional argument — no stdin mode — and /proc/<pid>/
+  # cmdline is world-readable for the life of that call, so any local
+  # account could read a long-lived credential off it. TOTP is just HMAC
+  # over a time counter (RFC 6238), so instead of shelling out we derive
+  # the code ourselves, right here, with the URI fed on stdin — it never
+  # touches argv at all. One fewer pass-cli invocation too.
+  printf '%s' "$uri" | python3 -c '
+import base64, hashlib, hmac, json, struct, sys, time
+from urllib.parse import urlparse, parse_qs
+
+uri = sys.stdin.read().strip()
+try:
+    parsed = urlparse(uri)
+    if parsed.scheme != "otpauth" or parsed.netloc.lower() != "totp":
+        raise ValueError("not a totp:// URI")
+    q = parse_qs(parsed.query)
+    secret_raw = q.get("secret", [None])[0]
+    if not secret_raw:
+        raise ValueError("no secret in URI")
+    algo_name = (q.get("algorithm", ["SHA1"])[0] or "SHA1").upper()
+    digits = int(q.get("digits", ["6"])[0] or 6)
+    period = int(q.get("period", ["30"])[0] or 30)
+    if digits < 6 or digits > 10 or period <= 0:
+        raise ValueError("unsupported digits/period")
+    digestmod = {"SHA1": hashlib.sha1, "SHA256": hashlib.sha256, "SHA512": hashlib.sha512}.get(algo_name)
+    if digestmod is None:
+        raise ValueError("unsupported algorithm")
+
+    s = secret_raw.strip().upper().replace(" ", "")
+    key = base64.b32decode(s + "=" * ((-len(s)) % 8))
+    counter = int(time.time() // period)
+    mac = hmac.new(key, struct.pack(">Q", counter), digestmod).digest()
+    offset = mac[-1] & 0x0F
+    code = (struct.unpack(">I", mac[offset:offset + 4])[0] & 0x7fffffff) % (10 ** digits)
+    print(json.dumps({"token": str(code).zfill(digits)}))
+except Exception as e:
+    print(json.dumps({"error": f"failed to generate TOTP: {e}"}))
+    sys.exit(1)
+' || { _err "failed to generate TOTP"; return 1; }
 }
 
 # Direct-fetch favicon for an item's guessed domain (never a third-party

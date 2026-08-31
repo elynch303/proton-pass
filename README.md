@@ -105,6 +105,10 @@ the existing colored-letter avatar; no fetch is attempted for those.
   locally as plain image files
 - Your PIN never appears in process argv and is never written to disk —
   see "How it works" above
+- TOTP codes are computed locally in this wrapper (standard RFC 6238 HMAC,
+  fed the `otpauth://` URI on stdin) rather than by shelling out to
+  `pass-cli totp generate SECRET`, so the TOTP seed never appears in any
+  process's argv either
 
 ## Uninstalling
 

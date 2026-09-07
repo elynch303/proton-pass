@@ -170,12 +170,13 @@ BarWidget {
     onExited: root.itemsLoading = false
   }
 
-  function refreshVaultsAndItems() {
+  function refreshVaultsAndItems(force) {
     vaultsProc.running = false; vaultsProc.running = true
     root.itemsLoading = true
     root.expandedKey = ""
     var args = [root.wrapperScript, "items"]
     if (root.selectedVaultId) { args.push("--vault"); args.push(root.selectedVaultId) }
+    if (force) { args.push("--force") }
     itemsProc.command = args
     itemsProc.running = false; itemsProc.running = true
   }
@@ -1022,7 +1023,7 @@ BarWidget {
             iconText: "󰑐"
             foreground: Color.popups.text
             tooltipText: "Refresh"
-            onClicked: root.refreshVaultsAndItems()
+            onClicked: root.refreshVaultsAndItems(true)
           }
         }
       }

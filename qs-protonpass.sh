@@ -25,7 +25,39 @@ TTY_HELPER="${QS_PROTONPASS_TTY_HELPER:-$(dirname "$(readlink -f "${BASH_SOURCE[
 # response otherwise blocks the widget indefinitely or gets handed to QML's
 # Repeaters uncapped.
 CLI_TIMEOUT="${QS_PROTONPASS_CLI_TIMEOUT:-10}"
-MAX_OUT_BYTES=1048576
+# `item list` fetches the whole vault from Proton's API in sequential
+# 100-item pages (no local-cache read path in pass-cli itself) — a large
+# vault (observed: 2672 items) takes 7-17s across ~27 round-trips, well
+# past CLI_TIMEOUT's 10s. Item-list calls get their own, longer ceiling.
+ITEM_LIST_TIMEOUT="${QS_PROTONPASS_ITEM_LIST_TIMEOUT:-45}"
+# Raised from the upstream default of 1MB: a large vault's item-metadata
+# JSON can legitimately exceed that (observed: 2600+ items -> ~1.45MB),
+# which silently dropped every item from this widget.
+MAX_OUT_BYTES=16777216
+
+# Cache for `item list` results: the paginated fetch above is the slow
+# part of every popup open, so short-TTL caching is what actually makes
+# "load faster" mean anything here — pass-cli has nothing to tune (no
+# page-size flag, no local-cache read mode). Explicit refresh (--force)
+# bypasses it.
+ITEMS_CACHE_DIR="${QS_PROTONPASS_CACHE_DIR:-$HOME/.cache/proton-pass/items}"
+ITEMS_CACHE_TTL="${QS_PROTONPASS_ITEMS_CACHE_TTL:-30}"
+mkdir -p "$ITEMS_CACHE_DIR" 2>/dev/null
+
+_cache_fresh() {
+  local f="$1" mtime now
+  [ -f "$f" ] || return 1
+  mtime="$(stat -c %Y "$f" 2>/dev/null)" || return 1
+  now="$(date +%s)"
+  [ $(( now - mtime )) -lt "$ITEMS_CACHE_TTL" ]
+}
+
+_cache_write() {
+  local f="$1" tmp
+  tmp="$(mktemp "$ITEMS_CACHE_DIR/.tmp.XXXXXX")" || return 1
+  cat > "$tmp"
+  mv -f "$tmp" "$f"
+}
 
 _err() {
   python3 -c 'import json,sys; print(json.dumps({"error": sys.argv[1]}))' "$1"
@@ -79,13 +111,31 @@ cmd_vaults() {
 # every vault from `vault list` and merge.
 cmd_items() {
   _require_cli || { _err "pass-cli not installed"; return 1; }
-  local vault_share_id=""
-  if [ "${1:-}" = "--vault" ]; then
-    vault_share_id="${2:-}"
-  fi
+  local vault_share_id="" force=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --vault) vault_share_id="${2:-}"; shift 2 ;;
+      --force) force=true; shift ;;
+      *) shift ;;
+    esac
+  done
 
   if [ -n "$vault_share_id" ]; then
-    timeout "$CLI_TIMEOUT" "$PASS_CLI" item list --share-id "$vault_share_id" --output json 2>/dev/null | head -c "$MAX_OUT_BYTES" || { _err "failed to list items"; return 1; }
+    local cache_file="$ITEMS_CACHE_DIR/vault-$(printf '%s' "$vault_share_id" | tr -c 'A-Za-z0-9_-' '_').json"
+    if [ "$force" != true ] && _cache_fresh "$cache_file"; then
+      cat "$cache_file"
+      return 0
+    fi
+    local out
+    out="$(timeout "$ITEM_LIST_TIMEOUT" "$PASS_CLI" item list --share-id "$vault_share_id" --output json 2>/dev/null | head -c "$MAX_OUT_BYTES")" || { _err "failed to list items"; return 1; }
+    printf '%s' "$out" | _cache_write "$cache_file"
+    printf '%s' "$out"
+    return 0
+  fi
+
+  local all_cache_file="$ITEMS_CACHE_DIR/all.json"
+  if [ "$force" != true ] && _cache_fresh "$all_cache_file"; then
+    cat "$all_cache_file"
     return 0
   fi
 
@@ -97,15 +147,17 @@ cmd_items() {
   # Per-vault fetch is capped (byte + count) so one oversized or malicious
   # vault can't blow up memory or the list handed to QML's Repeater; a
   # rejected vault is skipped exactly like an error from pass-cli itself.
-  printf '%s' "$vaults_json" | python3 -c '
+  local merged
+  merged="$(printf '%s' "$vaults_json" | python3 -c '
 import json, sys, subprocess
 
-MAX_BYTES = 1024 * 1024
+MAX_BYTES = 16 * 1024 * 1024
 MAX_ITEMS_PER_VAULT = 5000
 MAX_TOTAL_ITEMS = 20000
 
 vaults = json.loads(sys.stdin.read()).get("vaults", [])
 pass_cli = sys.argv[1]
+item_list_timeout = float(sys.argv[2])
 all_items = []
 for v in vaults:
     if len(all_items) >= MAX_TOTAL_ITEMS:
@@ -114,7 +166,7 @@ for v in vaults:
     try:
         out = subprocess.run(
             [pass_cli, "item", "list", "--share-id", share_id, "--output", "json"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=item_list_timeout,
         )
         if out.returncode != 0 or len(out.stdout.encode()) > MAX_BYTES:
             continue
@@ -125,7 +177,10 @@ for v in vaults:
     except Exception:
         continue
 print(json.dumps({"items": all_items[:MAX_TOTAL_ITEMS]}))
-' "$PASS_CLI" || { _err "failed to merge items"; return 1; }
+' "$PASS_CLI" "$ITEM_LIST_TIMEOUT")" || { _err "failed to merge items"; return 1; }
+
+  printf '%s' "$merged" | _cache_write "$all_cache_file"
+  printf '%s' "$merged"
 }
 
 # Single secret field, for a one-shot clipboard copy. Never persisted.

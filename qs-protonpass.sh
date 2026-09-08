@@ -25,7 +25,19 @@ TTY_HELPER="${QS_PROTONPASS_TTY_HELPER:-$(dirname "$(readlink -f "${BASH_SOURCE[
 # response otherwise blocks the widget indefinitely or gets handed to QML's
 # Repeaters uncapped.
 CLI_TIMEOUT="${QS_PROTONPASS_CLI_TIMEOUT:-10}"
-MAX_OUT_BYTES=1048576
+# `item list` is the one slow call here: pass-cli has no local-cache read
+# path for it, so it fetches the whole vault from Proton's API in sequential
+# 100-item pages. A large vault (observed: 2672 items) takes 7-17s across
+# ~27 round-trips — well past CLI_TIMEOUT's 10s, which silently killed the
+# fetch mid-flight and left the widget empty. Item-list calls get their own,
+# higher ceiling; every other pass-cli call stays on the 10s CLI_TIMEOUT.
+ITEM_LIST_TIMEOUT="${QS_PROTONPASS_ITEM_LIST_TIMEOUT:-45}"
+# Raised from the upstream default of 1MB: a large vault's item-metadata
+# JSON (no secrets — this is `item list`, not `item view`) can legitimately
+# exceed 1MB (observed: 2672 items -> ~1.45MB), and the old cap silently
+# dropped every item from such a vault. The per-vault/total item-count caps
+# in the fan-out below are still what bound what reaches QML's Repeater.
+MAX_OUT_BYTES=16777216
 
 _err() {
   python3 -c 'import json,sys; print(json.dumps({"error": sys.argv[1]}))' "$1"
@@ -85,7 +97,7 @@ cmd_items() {
   fi
 
   if [ -n "$vault_share_id" ]; then
-    timeout "$CLI_TIMEOUT" "$PASS_CLI" item list --share-id "$vault_share_id" --output json 2>/dev/null | head -c "$MAX_OUT_BYTES" || { _err "failed to list items"; return 1; }
+    timeout "$ITEM_LIST_TIMEOUT" "$PASS_CLI" item list --share-id "$vault_share_id" --output json 2>/dev/null | head -c "$MAX_OUT_BYTES" || { _err "failed to list items"; return 1; }
     return 0
   fi
 
@@ -98,23 +110,31 @@ cmd_items() {
   # vault can't blow up memory or the list handed to QML's Repeater; a
   # rejected vault is skipped exactly like an error from pass-cli itself.
   printf '%s' "$vaults_json" | python3 -c '
-import json, sys, subprocess
+import json, sys, subprocess, time
 
-MAX_BYTES = 1024 * 1024
+MAX_BYTES = 16 * 1024 * 1024
 MAX_ITEMS_PER_VAULT = 5000
 MAX_TOTAL_ITEMS = 20000
 
 vaults = json.loads(sys.stdin.read()).get("vaults", [])
 pass_cli = sys.argv[1]
+# Total wall-clock budget for the whole fan-out, so "All vaults" can never
+# hang for N_vaults * per-vault-timeout. A vault we run out of budget for is
+# skipped exactly like a pass-cli error — same contract as the byte/count
+# caps below.
+deadline = time.monotonic() + float(sys.argv[2])
 all_items = []
 for v in vaults:
     if len(all_items) >= MAX_TOTAL_ITEMS:
+        break
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
         break
     share_id = v.get("share_id")
     try:
         out = subprocess.run(
             [pass_cli, "item", "list", "--share-id", share_id, "--output", "json"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=remaining,
         )
         if out.returncode != 0 or len(out.stdout.encode()) > MAX_BYTES:
             continue
@@ -125,7 +145,7 @@ for v in vaults:
     except Exception:
         continue
 print(json.dumps({"items": all_items[:MAX_TOTAL_ITEMS]}))
-' "$PASS_CLI" || { _err "failed to merge items"; return 1; }
+' "$PASS_CLI" "$ITEM_LIST_TIMEOUT" || { _err "failed to merge items"; return 1; }
 }
 
 # Single secret field, for a one-shot clipboard copy. Never persisted.

@@ -97,8 +97,19 @@ cmd_items() {
   # Per-vault fetch is capped (byte + count) so one oversized or malicious
   # vault can't blow up memory or the list handed to QML's Repeater; a
   # rejected vault is skipped exactly like an error from pass-cli itself.
+  # Each vault's `item list` is its own pass-cli round-trip (CLI startup +
+  # a real network call to Proton's API), and pass-cli has no all-vaults
+  # list to avoid paying that N times — with 6 vaults this was ~1.5-1.8s
+  # *each*, sequentially, for ~10s total just to open the popup. None of
+  # these calls touch or depend on each other, so a thread pool runs them
+  # concurrently instead: still a fully live fetch every time (nothing
+  # cached, nothing persisted — every open re-asks pass-cli fresh), just
+  # not paying for N round-trips back to back. subprocess.run() blocks on
+  # I/O wait, which releases the GIL, so plain threads (not processes) are
+  # enough here despite Python's GIL.
   printf '%s' "$vaults_json" | python3 -c '
 import json, sys, subprocess
+from concurrent.futures import ThreadPoolExecutor
 
 MAX_BYTES = 1024 * 1024
 MAX_ITEMS_PER_VAULT = 5000
@@ -106,10 +117,8 @@ MAX_TOTAL_ITEMS = 20000
 
 vaults = json.loads(sys.stdin.read()).get("vaults", [])
 pass_cli = sys.argv[1]
-all_items = []
-for v in vaults:
-    if len(all_items) >= MAX_TOTAL_ITEMS:
-        break
+
+def fetch(v):
     share_id = v.get("share_id")
     try:
         out = subprocess.run(
@@ -117,13 +126,19 @@ for v in vaults:
             capture_output=True, text=True, timeout=15,
         )
         if out.returncode != 0 or len(out.stdout.encode()) > MAX_BYTES:
-            continue
+            return []
         items = json.loads(out.stdout).get("items", [])[:MAX_ITEMS_PER_VAULT]
         for it in items:
             it["vault_name"] = v.get("name")
-        all_items.extend(items)
+        return items
     except Exception:
-        continue
+        return []
+
+all_items = []
+if vaults:
+    with ThreadPoolExecutor(max_workers=min(len(vaults), 16)) as pool:
+        for items in pool.map(fetch, vaults):
+            all_items.extend(items)
 print(json.dumps({"items": all_items[:MAX_TOTAL_ITEMS]}))
 ' "$PASS_CLI" || { _err "failed to merge items"; return 1; }
 }

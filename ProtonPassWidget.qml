@@ -31,17 +31,65 @@ import qs.Ui
 // nothing actually reaches the clipboard (confirmed with a manual fifo
 // test). The helper process opens its own separate pipe to wl-copy and
 // closes that one itself, so wl-copy still gets a real EOF.
-// The clipboard is cleared automatically after ~35s or immediately if the
-// popup closes — by terminating the specific wl-copy process this plugin
-// started (tracked by pid, --foreground so it never forks away), and only
-// if it's still alive and still wl-copy, never a blind clipboard clear
-// that could erase something unrelated the user copied since.
+// The clipboard is cleared automatically after clipboardClearSeconds
+// (default 30, configurable — see that property below) regardless of
+// whether the popup is still open, by terminating the specific wl-copy
+// process this plugin started (tracked by pid, --foreground so it never
+// forks away), and only if it's still alive and still wl-copy, never a
+// blind clipboard clear that could erase something unrelated the user
+// copied since.
 BarWidget {
   id: root
   moduleName: "local.proton-pass"
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string wrapperScript: home + "/.local/bin/qs-protonpass.sh"
+
+  // ── local settings: plain preferences only (never a secret) ─────────────
+  // Same pattern as io.github.elynch303.kids-math's own progress.json:
+  // mkdir -p the state dir, then a FileView with atomicWrites. Edited from
+  // the in-popup Settings panel (gear icon), not shell.json — shell.json
+  // has no write path back from inside a widget, only a read-only one.
+  readonly property string settingsDir: home + "/.local/state/omarchy/plugins/io.github.elynch303.proton-pass"
+  readonly property string settingsPath: settingsDir + "/settings.json"
+  property bool settingsReady: false
+  property bool settingsOpen: false
+  // How long a copied secret stays on the clipboard before auto-clearing.
+  // Bounds shared by the UI validator and the settings-file load below —
+  // the latter matters because an out-of-range value there (corruption, or
+  // a manual edit) would otherwise feed straight into clipboardClearTimer's
+  // interval, e.g. an absurdly large one effectively disabling the
+  // clipboard's own security backstop rather than just showing a weird
+  // number in the UI.
+  readonly property int clipboardClearMin: 5
+  readonly property int clipboardClearMax: 300
+  property int clipboardClearSeconds: 30
+
+  Process {
+    id: settingsMkdirProc
+    command: ["mkdir", "-p", root.settingsDir]
+    onExited: settingsFile.reload()
+  }
+  FileView {
+    id: settingsFile
+    path: root.settingsPath
+    atomicWrites: true
+    printErrors: false
+    onLoaded: {
+      try {
+        var d = JSON.parse(text())
+        if (typeof d.clipboardClearSeconds === "number" && isFinite(d.clipboardClearSeconds))
+          root.clipboardClearSeconds = Math.max(root.clipboardClearMin,
+            Math.min(root.clipboardClearMax, Math.round(d.clipboardClearSeconds)))
+      } catch (e) {}
+      root.settingsReady = true
+    }
+    onLoadFailed: root.settingsReady = true // no file yet — defaults stand
+  }
+  function saveSettings() {
+    if (!root.settingsReady) return
+    settingsFile.setText(JSON.stringify({ clipboardClearSeconds: root.clipboardClearSeconds }))
+  }
 
   property bool wrapperInstalled: false
   property string sessionState: "missing" // missing | logged-out | locked | unlocked
@@ -91,7 +139,7 @@ BarWidget {
     onLoaded: { root.wrapperInstalled = true; root.refreshStatus() }
     onLoadFailed: { root.wrapperInstalled = false; root.sessionState = "missing" }
   }
-  Component.onCompleted: scriptProbe.reload()
+  Component.onCompleted: { scriptProbe.reload(); settingsMkdirProc.running = true }
 
   // ── session status polling (cheap/local; keeps the badge accurate) ─────
   Process {
@@ -240,7 +288,7 @@ BarWidget {
   }
   Timer {
     id: clipboardClearTimer
-    interval: 35000
+    interval: root.clipboardClearSeconds * 1000
     repeat: false
     onTriggered: { root.ownershipSafeClear(); root.copyFeedback = "" }
   }
@@ -758,14 +806,38 @@ BarWidget {
       : null
 
     onOpenChanged: {
-      if (!open) {
-        root.clearClipboardNow()
+      if (open) {
+        // KeyboardPanel's own focus-prime (see its header comment) does a
+        // single Qt.callLater(forceActiveFocus) on focusTarget when this
+        // panel opens — that's the same one-tick defer that PinBoxes.
+        // focusIndex() used to rely on internally before it started
+        // wedging again (see focusIndex's comment for why a callLater's
+        // margin isn't guaranteed). We can't edit KeyboardPanel.qml itself
+        // (first-party, under /usr/share/omarchy), so instead of hoping
+        // its single attempt landed, redundantly re-assert focus onto PIN
+        // box 0 ourselves a real 20ms later via focusIndex's own Timer —
+        // a harmless no-op if the first attempt already stuck, a fix if
+        // it didn't.
+        if (root.sessionState === "locked") pinUnlockBoxes.focusIndex(0)
+        else if (root.sessionState === "unlocked" && root.lockSetupStage !== "") pinSetupBoxes.focusIndex(0)
+      } else {
+        // NOT clearing the clipboard here: the whole point of copying a
+        // secret is to paste it somewhere else, and dismissing this popup
+        // (by clicking whatever you're about to paste into) is the normal,
+        // expected way that happens. Wiping the clipboard the instant the
+        // popup closes was defeating copy for exactly that case — it only
+        // "worked" when something other than a click (e.g. Alt+Tab) moved
+        // focus away without dismissing the popup first. The
+        // clipboardClearTimer already started by copyToClipboard() (see
+        // clipboardClearSeconds) is the real security backstop and keeps
+        // running regardless of this popup's open state.
         root.copyFeedback = ""
         root.expandedKey = "" // cascades via onExpandedKeyChanged: clears reveal + detailUsername too
         root.searchQuery = ""
         searchField.text = ""
         root.cancelLockSetup()
         root.pinError = ""
+        root.settingsOpen = false
       }
     }
 
@@ -823,21 +895,35 @@ BarWidget {
         }
         return s
       }
-      // Deferred via Qt.callLater, same as clear() below already did: moving
-      // Qt's active-focus item to a sibling TextInput synchronously, from
-      // inside the very key-event handling that's still in progress (typing
-      // a digit auto-advances to the next box), can race the Wayland
-      // text-input-v3 enable/disable handshake that has to happen on every
-      // focus change — the symptom is keystrokes silently going nowhere
-      // until something else (e.g. a NumLock toggle) forces a fresh
-      // modifier event through and un-wedges it. Letting the current event
-      // finish first, on the next loop tick, avoids the race instead of
-      // relying on an unrelated event to paper over it.
-      function focusIndex(i) {
-        Qt.callLater(function() {
-          var it = pinRepeater.itemAt(i)
+      // Moving Qt's active-focus item to a sibling TextInput synchronously,
+      // from inside the very key-event handling that's still in progress
+      // (typing a digit auto-advances to the next box), can race the
+      // Wayland text-input-v3 enable/disable handshake that has to happen
+      // on every focus change — the symptom is keystrokes silently going
+      // nowhere until something else (e.g. a NumLock toggle) forces a
+      // fresh modifier event through and un-wedges it.
+      //
+      // A bare Qt.callLater only reorders this to later in the *same*
+      // event-loop tick — it doesn't wait for the compositor round-trip
+      // the disable/enable handshake actually needs, it just happens to
+      // usually be late enough. A short Timer instead yields real
+      // wall-clock time, which is what the handshake needs, not "next in
+      // the queue" — this held with a plain callLater until it started
+      // reappearing intermittently, most likely because a kernel update
+      // changed input-event dispatch timing enough to shrink whatever
+      // margin the old approach had.
+      property int pendingFocusIndex: -1
+      Timer {
+        id: focusMoveTimer
+        interval: 20
+        onTriggered: {
+          var it = pinRepeater.itemAt(pinBoxes.pendingFocusIndex)
           if (it) it.textInput.forceActiveFocus()
-        })
+        }
+      }
+      function focusIndex(i) {
+        pendingFocusIndex = i
+        focusMoveTimer.restart()
       }
       function clear() {
         for (var i = 0; i < pinRepeater.count; i++) {
@@ -845,6 +931,36 @@ BarWidget {
           if (it) it.textInput.text = ""
         }
         pinBoxes.focusIndex(0)
+      }
+
+      // A numeric keypad with NumLock off sends navigation-function
+      // keysyms (Home/End/arrows/PageUp/PageDown/Insert) for the exact
+      // same physical keys that would otherwise be digits — confirmed as
+      // the real cause of "typing the PIN does nothing": the main
+      // keyboard's number row still works fine at the same moment the
+      // keypad doesn't, which rules out a focus problem (that would break
+      // both) and points at the keypad's NumLock LED being desynced from
+      // whatever state the compositor's XKB layer actually used to
+      // translate that keypress. Qt still tags these with
+      // Qt.KeypadModifier even though `key` no longer looks like a digit,
+      // so recognize them by that combination and restore the intended
+      // digit ourselves — this works regardless of which way NumLock is
+      // desynced, since we're keying off "this physical key is on the
+      // keypad", not off NumLock's reported state at all.
+      function keypadDigit(key) {
+        switch (key) {
+          case Qt.Key_Insert: return "0"
+          case Qt.Key_End: return "1"
+          case Qt.Key_Down: return "2"
+          case Qt.Key_PageDown: return "3"
+          case Qt.Key_Left: return "4"
+          case Qt.Key_Clear: return "5"
+          case Qt.Key_Right: return "6"
+          case Qt.Key_Home: return "7"
+          case Qt.Key_Up: return "8"
+          case Qt.Key_PageUp: return "9"
+          default: return null
+        }
       }
 
       Row {
@@ -892,6 +1008,14 @@ BarWidget {
                 if (event.key === Qt.Key_Backspace && text.length === 0 && box.index > 0) {
                   pinBoxes.focusIndex(box.index - 1)
                   event.accepted = true
+                  return
+                }
+                if (event.modifiers & Qt.KeypadModifier) {
+                  var digit = pinBoxes.keypadDigit(event.key)
+                  if (digit !== null) {
+                    text = digit
+                    event.accepted = true
+                  }
                 }
               }
             }
@@ -1009,7 +1133,7 @@ BarWidget {
           // Compact vault chip, like the extension's own header selector —
           // only meaningful in the browsing list, not mid-detail or mid-setup.
           SearchableDropdown {
-            visible: root.sessionState === "unlocked" && root.expandedKey === "" && root.lockSetupStage === ""
+            visible: root.sessionState === "unlocked" && root.expandedKey === "" && root.lockSetupStage === "" && !root.settingsOpen
             width: Style.space(112)
             showLabel: false
             options: root.vaults
@@ -1023,6 +1147,13 @@ BarWidget {
             foreground: Color.popups.text
             tooltipText: "Refresh"
             onClicked: root.refreshVaultsAndItems()
+          }
+          PanelActionButton {
+            visible: root.sessionState === "unlocked"
+            iconText: "󰒓"
+            foreground: Color.popups.text
+            tooltipText: "Settings"
+            onClicked: root.settingsOpen = true
           }
         }
       }
@@ -1219,13 +1350,43 @@ BarWidget {
         ActionBtn { label: "Cancel"; onClicked: root.cancelLockSetup() }
       }
 
-      // ── unlocked: list view (vault picker + search + item list) ─────────
+      // ── unlocked: settings panel (gear icon) — auto-lock/PIN status and
+      // setup (moved here from the list view header), plus plugin
+      // preferences like the clipboard clear timeout. Gated on
+      // lockSetupStage === "" so starting/removing auto-lock from in here
+      // correctly hands off to that dedicated flow above instead of
+      // showing both at once, and lands back here on cancel/finish since
+      // settingsOpen itself is untouched by that flow. ────────────────────
       Column {
-        visible: root.sessionState === "unlocked" && root.expandedKey === "" && root.lockSetupStage === ""
+        visible: root.sessionState === "unlocked" && root.settingsOpen && root.lockSetupStage === ""
         width: parent.width
-        spacing: Style.spacing.md
+        spacing: Style.spacing.lg
 
         PanelSeparator { foreground: Color.popups.text }
+
+        Item {
+          width: parent.width
+          height: Math.max(Style.space(28), settingsBackBtn.height)
+          PanelActionButton {
+            id: settingsBackBtn
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: "󰅁"
+            foreground: Color.popups.text
+            tooltipText: "Back"
+            onClicked: root.settingsOpen = false
+          }
+          Text {
+            anchors.left: settingsBackBtn.right
+            anchors.leftMargin: Style.spacing.sm
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Settings"
+            color: Color.popups.text
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+            font.bold: true
+          }
+        }
 
         // Auto-lock status/setup — only pass-cli's own lock exists here,
         // separate from (and unreadable from) the browser extension's PIN;
@@ -1271,6 +1432,56 @@ BarWidget {
             }
           }
         }
+
+        PanelSeparator { foreground: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.15) }
+
+        Row {
+          width: parent.width
+          spacing: Style.spacing.sm
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Clear clipboard after"
+            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.6)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+          TextField {
+            id: clipboardClearField
+            width: Style.space(64)
+            verticalPadding: Style.space(2)
+            foreground: Color.popups.text
+            text: String(root.clipboardClearSeconds)
+            validator: IntValidator { bottom: root.clipboardClearMin; top: root.clipboardClearMax }
+            // Commits on blur/Enter, not per keystroke — this writes to
+            // disk (settingsFile.setText), so typing "150" shouldn't
+            // trigger a write for the momentary "1" and "15" along the way.
+            onEditingFinished: {
+              var v = parseInt(text, 10)
+              if (!isNaN(v) && v >= root.clipboardClearMin && v <= root.clipboardClearMax) {
+                root.clipboardClearSeconds = v
+                root.saveSettings()
+              } else {
+                text = String(root.clipboardClearSeconds)
+              }
+            }
+          }
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            text: "s (" + root.clipboardClearMin + "–" + root.clipboardClearMax + ")"
+            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.6)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+        }
+      }
+
+      // ── unlocked: list view (vault picker + search + item list) ─────────
+      Column {
+        visible: root.sessionState === "unlocked" && root.expandedKey === "" && root.lockSetupStage === "" && !root.settingsOpen
+        width: parent.width
+        spacing: Style.spacing.md
+
+        PanelSeparator { foreground: Color.popups.text }
 
         Item {
           width: parent.width
@@ -1597,7 +1808,7 @@ BarWidget {
         Text {
           visible: root.copyFeedback !== ""
           width: parent.width
-          text: root.copyFeedback + " — clears in 35s"
+          text: root.copyFeedback + " — clears in " + root.clipboardClearSeconds + "s"
           color: Color.accent
           font.family: Style.font.family
           font.pixelSize: Style.font.caption

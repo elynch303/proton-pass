@@ -120,7 +120,7 @@ cmd_items() {
   # I/O wait, which releases the GIL, so plain threads (not processes) are
   # enough here despite Python's GIL.
   printf '%s' "$vaults_json" | python3 -c '
-import json, sys, subprocess, time
+import json, os, select, signal, sys, subprocess, time
 from concurrent.futures import ThreadPoolExecutor
 
 MAX_BYTES = 16 * 1024 * 1024
@@ -137,23 +137,79 @@ pass_cli = sys.argv[1]
 # timeout all over again as if it had started immediately.
 deadline = time.monotonic() + float(sys.argv[2])
 
+def _read_bounded(proc, max_bytes, deadline):
+    # subprocess.run(capture_output=True) buffers everything the child
+    # writes before any size check ever runs — the MAX_BYTES check used to
+    # happen only after the fact, so the producer-side boundary was not
+    # actually enforced (a pathological/huge response is fully read into
+    # memory regardless of the cap). This reads directly off the pipe in
+    # bounded chunks, never accumulating past max_bytes + 1, and killing
+    # the child the moment either the byte cap or the deadline is hit
+    # rather than waiting for it to finish on its own.
+    chunks = []
+    total = 0
+    fd = proc.stdout.fileno()
+    while True:
+        remaining_time = deadline - time.monotonic()
+        if remaining_time <= 0:
+            return b"".join(chunks), False, True
+        ready, _, _ = select.select([fd], [], [], min(remaining_time, 0.5))
+        if not ready:
+            continue
+        want = min(65536, max_bytes + 1 - total)
+        if want <= 0:
+            return b"".join(chunks), True, False
+        chunk = os.read(fd, want)
+        if not chunk:
+            return b"".join(chunks), False, False  # EOF
+        chunks.append(chunk)
+        total += len(chunk)
+
+def _reap(proc):
+    # start_new_session=True below makes pass_cli its own process-group
+    # leader, so anything IT spawns inherits that group too — killing just
+    # the pid we hold is only guaranteed to reach that one process, not
+    # descendants (confirmed live: a synthetic child that forked its own
+    # subprocess left that subprocess running after proc.kill() alone).
+    # Same reap pattern as the _reap() in qs-protonpass-tty.py, minus the
+    # SIGTERM-first grace period — this path only runs after already
+    # deciding the response is oversized or the deadline is blown, so
+    # there is nothing left worth waiting on.
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+
 def fetch(v):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return []
     share_id = v.get("share_id")
+    proc = None
     try:
-        out = subprocess.run(
+        proc = subprocess.Popen(
             [pass_cli, "item", "list", "--share-id", share_id, "--output", "json"],
-            capture_output=True, text=True, timeout=remaining,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
-        if out.returncode != 0 or len(out.stdout.encode()) > MAX_BYTES:
+        data, overflowed, timed_out = _read_bounded(proc, MAX_BYTES, deadline)
+        if overflowed or timed_out:
+            _reap(proc)
             return []
-        items = json.loads(out.stdout).get("items", [])[:MAX_ITEMS_PER_VAULT]
+        if proc.wait(timeout=5) != 0:
+            return []
+        items = json.loads(data.decode("utf-8", "replace")).get("items", [])[:MAX_ITEMS_PER_VAULT]
         for it in items:
             it["vault_name"] = v.get("name")
         return items
     except Exception:
+        if proc is not None:
+            _reap(proc)
         return []
 
 all_items = []
@@ -344,7 +400,17 @@ sys.exit(1)
   }
 
   tmp="$cache_dir/$safe.tmp"
-  if ! curl -fsSL --max-time 3 --resolve "$domain:443:$safe_ip" -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" "https://$domain/favicon.ico" -o "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+  # No -L: the --resolve pin above only covers the address just validated
+  # for $domain itself — curl following a redirect would do a fresh,
+  # unpinned resolution (or connect straight to an IP literal in a
+  # Location header) for whatever host the *response* names, completely
+  # bypassing the check above. A domain that redirects its favicon just
+  # falls through to the existing colored-letter avatar, same as any other
+  # miss; this is cosmetic, never worth reopening SSRF for.
+  # --max-filesize bounds the response itself (nothing bounded it before) —
+  # 5MB is generous for a favicon and enforced during the transfer, not
+  # just against a possibly-absent/lying Content-Length header.
+  if ! curl -fsS --max-time 3 --max-filesize 5242880 --resolve "$domain:443:$safe_ip" -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" "https://$domain/favicon.ico" -o "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
     rm -f "$tmp"
     touch "$cache_dir/$safe.miss"
     _err "no favicon for $domain"

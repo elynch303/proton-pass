@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // Proton Pass bar-widget: vault selection, item search, and session
@@ -760,7 +761,7 @@ BarWidget {
           radius: width / 2
           color: "#e8a33d"
           border.width: 1
-          border.color: Color.popups.background
+          border.color: Commons.Color.popups.background
           anchors.right: parent.right
           anchors.bottom: parent.bottom
           Text {
@@ -799,7 +800,7 @@ BarWidget {
     owner: root
     contentWidth: Style.space(320)
     contentHeight: bodyCol.implicitHeight + padding * 2
-    borderSpec: Border.flat(Color.accent, Math.max(2, Style.space(2)))
+    borderSpec: Border.flat(Commons.Color.accent, Math.max(2, Style.space(2)))
     focusTarget: root.sessionState === "locked" ? pinUnlockBoxes
       : (root.sessionState === "unlocked" && root.lockSetupStage !== "") ? pinSetupBoxes
       : (root.sessionState === "unlocked") ? searchField
@@ -850,15 +851,15 @@ BarWidget {
       width: Math.max(Style.space(90), lbl.implicitWidth + Style.spacing.lg)
       height: Style.spacing.controlHeight
       radius: Style.cornerRadius
-      color: abMa.containsMouse ? Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.08) : "transparent"
+      color: abMa.containsMouse ? Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.08) : "transparent"
       border.width: 1
-      border.color: abMa.containsMouse ? Color.accent : Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.15)
+      border.color: abMa.containsMouse ? Commons.Color.accent : Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.15)
       Behavior on color { ColorAnimation { duration: 120 } }
       Text {
         id: lbl
         anchors.centerIn: parent
         text: ab.label
-        color: abMa.containsMouse ? Color.accent : Color.popups.text
+        color: abMa.containsMouse ? Commons.Color.accent : Commons.Color.popups.text
         font.family: Style.font.family
         font.pixelSize: Style.font.caption
       }
@@ -976,9 +977,9 @@ BarWidget {
             width: Style.space(38)
             height: Style.space(46)
             radius: Style.cornerRadius
-            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.05)
+            color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.05)
             border.width: input.activeFocus ? 2 : 1
-            border.color: input.activeFocus ? Color.accent : Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.15)
+            border.color: input.activeFocus ? Commons.Color.accent : Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.15)
             Behavior on border.color { ColorAnimation { duration: 100 } }
 
             TextInput {
@@ -987,7 +988,7 @@ BarWidget {
               focus: box.index === 0
               horizontalAlignment: TextInput.AlignHCenter
               verticalAlignment: TextInput.AlignVCenter
-              color: Color.popups.text
+              color: Commons.Color.popups.text
               font.family: Style.font.family
               font.pixelSize: Style.font.subtitle
               maximumLength: 1
@@ -1043,9 +1044,9 @@ BarWidget {
       width: parent.width
       height: Style.space(54)
       radius: Style.cornerRadius
-      color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.05)
+      color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.05)
       border.width: 1
-      border.color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.10)
+      border.color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.10)
 
       Column {
         anchors.left: parent.left
@@ -1056,7 +1057,7 @@ BarWidget {
         spacing: Style.space(2)
         Text {
           text: fr.label
-          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5)
+          color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.5)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
         }
@@ -1070,7 +1071,7 @@ BarWidget {
           // look like a tag as styled/linked content instead of literal
           // text.
           textFormat: Text.PlainText
-          color: Color.popups.text
+          color: Commons.Color.popups.text
           font.family: Style.font.family
           font.pixelSize: Style.font.body
           elide: Text.ElideRight
@@ -1086,13 +1087,13 @@ BarWidget {
         PanelActionButton {
           visible: fr.secretField
           iconText: fr.revealed ? "󰈉" : "󰈈"
-          foreground: Color.popups.text
+          foreground: Commons.Color.popups.text
           tooltipText: fr.revealed ? "Hide" : "Reveal"
           onClicked: fr.revealRequested()
         }
         PanelActionButton {
           iconText: "󰆏"
-          foreground: Color.popups.text
+          foreground: Commons.Color.popups.text
           tooltipText: "Copy"
           onClicked: fr.copyRequested()
         }
@@ -1121,7 +1122,7 @@ BarWidget {
           anchors.leftMargin: Style.spacing.sm
           anchors.verticalCenter: parent.verticalCenter
           text: "Proton Pass"
-          color: Color.popups.text
+          color: Commons.Color.popups.text
           font.family: Style.font.family
           font.pixelSize: Style.font.subtitle
           font.bold: true
@@ -1144,14 +1145,14 @@ BarWidget {
           PanelActionButton {
             visible: root.sessionState === "unlocked"
             iconText: "󰑐"
-            foreground: Color.popups.text
+            foreground: Commons.Color.popups.text
             tooltipText: "Refresh"
             onClicked: root.refreshVaultsAndItems()
           }
           PanelActionButton {
             visible: root.sessionState === "unlocked"
             iconText: "󰒓"
-            foreground: Color.popups.text
+            foreground: Commons.Color.popups.text
             tooltipText: "Settings"
             onClicked: root.settingsOpen = true
           }
@@ -1163,11 +1164,11 @@ BarWidget {
         visible: root.sessionState === "missing"
         width: parent.width
         spacing: Style.spacing.xs
-        PanelSeparator { foreground: Color.popups.text }
+        PanelSeparator { foreground: Commons.Color.popups.text }
         Text {
           width: parent.width
           text: "pass-cli not found, or the plugin's helper script isn't installed.\nRun install.sh, then `pass-cli login` in a terminal."
-          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.6)
+          color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.6)
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
           wrapMode: Text.Wrap
@@ -1179,11 +1180,11 @@ BarWidget {
         visible: root.sessionState === "logged-out"
         width: parent.width
         spacing: Style.spacing.md
-        PanelSeparator { foreground: Color.popups.text }
+        PanelSeparator { foreground: Commons.Color.popups.text }
         Text {
           width: parent.width
           text: "Not logged in to Proton Pass."
-          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.6)
+          color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.6)
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
           wrapMode: Text.Wrap
@@ -1198,7 +1199,7 @@ BarWidget {
         width: parent.width
         spacing: Style.spacing.lg
 
-        PanelSeparator { foreground: Color.popups.text }
+        PanelSeparator { foreground: Commons.Color.popups.text }
 
         Image {
           anchors.horizontalCenter: parent.horizontalCenter
@@ -1211,7 +1212,7 @@ BarWidget {
           width: parent.width
           horizontalAlignment: Text.AlignHCenter
           text: "Unlock Proton Pass"
-          color: Color.popups.text
+          color: Commons.Color.popups.text
           font.family: Style.font.family
           font.pixelSize: Style.font.subtitle
           font.bold: true
@@ -1220,7 +1221,7 @@ BarWidget {
           width: parent.width
           horizontalAlignment: Text.AlignHCenter
           text: "Enter your PIN code"
-          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.55)
+          color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.55)
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
         }
@@ -1241,7 +1242,7 @@ BarWidget {
           horizontalAlignment: Text.AlignHCenter
           visible: root.pinBusy || root.pinError !== ""
           text: root.pinBusy ? "Unlocking…" : root.pinError
-          color: root.pinBusy ? Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5) : Color.urgent
+          color: root.pinBusy ? Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.5) : Commons.Color.urgent
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
         }
@@ -1250,7 +1251,7 @@ BarWidget {
           width: parent.width
           horizontalAlignment: Text.AlignHCenter
           text: "Sign out"
-          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, signOutMa.containsMouse ? 0.8 : 0.45)
+          color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, signOutMa.containsMouse ? 0.8 : 0.45)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
           font.underline: signOutMa.containsMouse
@@ -1272,7 +1273,7 @@ BarWidget {
         width: parent.width
         spacing: Style.spacing.lg
 
-        PanelSeparator { foreground: Color.popups.text }
+        PanelSeparator { foreground: Commons.Color.popups.text }
 
         Text {
           width: parent.width
@@ -1280,7 +1281,7 @@ BarWidget {
           text: root.lockSetupStage === "enter" ? "Choose a PIN"
             : root.lockSetupStage === "confirm" ? "Confirm your PIN"
             : "Enter your PIN to remove auto-lock"
-          color: Color.popups.text
+          color: Commons.Color.popups.text
           font.family: Style.font.family
           font.pixelSize: Style.font.body
           font.bold: true
@@ -1291,7 +1292,7 @@ BarWidget {
           visible: root.lockSetupStage === "enter"
           horizontalAlignment: Text.AlignHCenter
           text: "Pick a 6-digit PIN and how long you can be idle before it locks."
-          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5)
+          color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.5)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
           wrapMode: Text.Wrap
@@ -1304,7 +1305,7 @@ BarWidget {
           Text {
             anchors.verticalCenter: parent.verticalCenter
             text: "Lock after"
-            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.6)
+            color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.6)
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
           }
@@ -1312,7 +1313,7 @@ BarWidget {
             id: idleTimeoutField
             width: Style.space(64)
             verticalPadding: Style.space(2)
-            foreground: Color.popups.text
+            foreground: Commons.Color.popups.text
             text: root.lockSetupIdleTimeoutText
             validator: IntValidator { bottom: 30; top: 900 }
             onTextChanged: root.lockSetupIdleTimeoutText = text
@@ -1320,7 +1321,7 @@ BarWidget {
           Text {
             anchors.verticalCenter: parent.verticalCenter
             text: "s idle (30–900)"
-            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.6)
+            color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.6)
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
           }
@@ -1342,7 +1343,7 @@ BarWidget {
           horizontalAlignment: Text.AlignHCenter
           visible: root.pinBusy || root.pinError !== ""
           text: root.pinBusy ? "Working…" : root.pinError
-          color: root.pinBusy ? Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5) : Color.urgent
+          color: root.pinBusy ? Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.5) : Commons.Color.urgent
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
         }
@@ -1362,7 +1363,7 @@ BarWidget {
         width: parent.width
         spacing: Style.spacing.lg
 
-        PanelSeparator { foreground: Color.popups.text }
+        PanelSeparator { foreground: Commons.Color.popups.text }
 
         Item {
           width: parent.width
@@ -1372,7 +1373,7 @@ BarWidget {
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
             iconText: "󰅁"
-            foreground: Color.popups.text
+            foreground: Commons.Color.popups.text
             tooltipText: "Back"
             onClicked: root.settingsOpen = false
           }
@@ -1381,7 +1382,7 @@ BarWidget {
             anchors.leftMargin: Style.spacing.sm
             anchors.verticalCenter: parent.verticalCenter
             text: "Settings"
-            color: Color.popups.text
+            color: Commons.Color.popups.text
             font.family: Style.font.family
             font.pixelSize: Style.font.body
             font.bold: true
@@ -1401,7 +1402,7 @@ BarWidget {
             Text {
               anchors.verticalCenter: parent.verticalCenter
               text: "󰌾"
-              color: root.hasLock ? Color.accent : Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.4)
+              color: root.hasLock ? Commons.Color.accent : Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.4)
               font.family: Style.font.family
               font.pixelSize: Style.font.body
             }
@@ -1409,7 +1410,7 @@ BarWidget {
               anchors.verticalCenter: parent.verticalCenter
               width: parent.width - Style.space(24) - autoLockLink.implicitWidth - Style.spacing.sm * 2
               text: root.hasLock ? ("Auto-lock on · " + (root.configuredIdleTimeout !== null ? root.configuredIdleTimeout + "s idle" : "idle timeout unknown")) : "Auto-lock isn't set up"
-              color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.6)
+              color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.6)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
               elide: Text.ElideRight
@@ -1418,7 +1419,7 @@ BarWidget {
               id: autoLockLink
               anchors.verticalCenter: parent.verticalCenter
               text: root.hasLock ? "Remove" : "Set up"
-              color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, autoLockMa.containsMouse ? 1.0 : 0.8)
+              color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, autoLockMa.containsMouse ? 1.0 : 0.8)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
               font.underline: autoLockMa.containsMouse
@@ -1433,7 +1434,7 @@ BarWidget {
           }
         }
 
-        PanelSeparator { foreground: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.15) }
+        PanelSeparator { foreground: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.15) }
 
         Row {
           width: parent.width
@@ -1441,7 +1442,7 @@ BarWidget {
           Text {
             anchors.verticalCenter: parent.verticalCenter
             text: "Clear clipboard after"
-            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.6)
+            color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.6)
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
           }
@@ -1449,7 +1450,7 @@ BarWidget {
             id: clipboardClearField
             width: Style.space(64)
             verticalPadding: Style.space(2)
-            foreground: Color.popups.text
+            foreground: Commons.Color.popups.text
             text: String(root.clipboardClearSeconds)
             validator: IntValidator { bottom: root.clipboardClearMin; top: root.clipboardClearMax }
             // Commits on blur/Enter, not per keystroke — this writes to
@@ -1468,7 +1469,7 @@ BarWidget {
           Text {
             anchors.verticalCenter: parent.verticalCenter
             text: "s (" + root.clipboardClearMin + "–" + root.clipboardClearMax + ")"
-            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.6)
+            color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.6)
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
           }
@@ -1481,7 +1482,7 @@ BarWidget {
         width: parent.width
         spacing: Style.spacing.md
 
-        PanelSeparator { foreground: Color.popups.text }
+        PanelSeparator { foreground: Commons.Color.popups.text }
 
         Item {
           width: parent.width
@@ -1492,7 +1493,7 @@ BarWidget {
             anchors.fill: parent
             leftPadding: Style.space(30)
             placeholderText: "Search items..."
-            foreground: Color.popups.text
+            foreground: Commons.Color.popups.text
             onTextChanged: root.searchQuery = text
           }
           Text {
@@ -1500,7 +1501,7 @@ BarWidget {
             anchors.leftMargin: Style.spacing.sm
             anchors.verticalCenter: parent.verticalCenter
             text: "󰍉"
-            color: Qt.darker(Color.popups.text, 1.5)
+            color: Qt.darker(Commons.Color.popups.text, 1.5)
             font.family: Style.font.family
             font.pixelSize: Style.font.body
           }
@@ -1509,7 +1510,7 @@ BarWidget {
         Text {
           visible: root.itemsLoading
           text: "Loading…"
-          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5)
+          color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.5)
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
         }
@@ -1517,7 +1518,7 @@ BarWidget {
         Text {
           visible: !root.itemsLoading && root.filteredItems.length === 0
           text: root.items.length === 0 ? "No items in this vault." : "No matches."
-          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5)
+          color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.5)
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
         }
@@ -1548,7 +1549,7 @@ BarWidget {
                 height: Style.space(44)
                 radius: Style.cornerRadius
                 color: rowMa.containsMouse
-                  ? Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.08)
+                  ? Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.08)
                   : "transparent"
                 Behavior on color { ColorAnimation { duration: 100 } }
 
@@ -1593,7 +1594,7 @@ BarWidget {
                   anchors.rightMargin: Style.spacing.sm
                   anchors.verticalCenter: parent.verticalCenter
                   text: "󰅂"
-                  color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, rowMa.containsMouse ? 0.6 : 0.3)
+                  color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, rowMa.containsMouse ? 0.6 : 0.3)
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
                   Behavior on color { ColorAnimation { duration: 100 } }
@@ -1610,7 +1611,7 @@ BarWidget {
                     width: parent.width
                     text: rowCol.modelData.title
                     textFormat: Text.PlainText // vault item title — see FieldRow's Text for why
-                    color: Color.popups.text
+                    color: Commons.Color.popups.text
                     font.family: Style.font.family
                     font.pixelSize: Style.font.body
                     elide: Text.ElideRight
@@ -1620,7 +1621,7 @@ BarWidget {
                     visible: text !== ""
                     text: rowCol.modelData.vault_name || ""
                     textFormat: Text.PlainText // vault name — see FieldRow's Text for why
-                    color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.45)
+                    color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.45)
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
                     elide: Text.ElideRight
@@ -1653,7 +1654,7 @@ BarWidget {
         readonly property var item: root.findItem(root.expandedKey)
         readonly property bool isLogin: detailCol.item && detailCol.item.item_type === "login"
 
-        PanelSeparator { foreground: Color.popups.text }
+        PanelSeparator { foreground: Commons.Color.popups.text }
 
         Item {
           width: parent.width
@@ -1664,7 +1665,7 @@ BarWidget {
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
             iconText: "󰅁"
-            foreground: Color.popups.text
+            foreground: Commons.Color.popups.text
             tooltipText: "Back"
             onClicked: root.expandedKey = ""
           }
@@ -1714,7 +1715,7 @@ BarWidget {
               width: parent.width
               text: detailCol.item ? detailCol.item.title : ""
               textFormat: Text.PlainText // vault item title — see FieldRow's Text for why
-              color: Color.popups.text
+              color: Commons.Color.popups.text
               font.family: Style.font.family
               font.pixelSize: Style.font.body
               font.bold: true
@@ -1725,7 +1726,7 @@ BarWidget {
               visible: text !== ""
               text: detailCol.item ? (detailCol.item.vault_name || "") : ""
               textFormat: Text.PlainText // vault name — see FieldRow's Text for why
-              color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.45)
+              color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.45)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
               elide: Text.ElideRight
@@ -1779,7 +1780,7 @@ BarWidget {
           spacing: Style.space(2)
           Text {
             text: "Last modified"
-            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.45)
+            color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.45)
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
           }
@@ -1789,7 +1790,7 @@ BarWidget {
               return isNaN(d.getTime()) ? root.detailModified : Qt.formatDateTime(d, "MMM d, yyyy · h:mm AP")
             }
             textFormat: Text.PlainText // falls back to the raw pass-cli timestamp string if unparseable
-            color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.7)
+            color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.7)
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
           }
@@ -1799,7 +1800,7 @@ BarWidget {
           visible: detailCol.item && !detailCol.isLogin
           width: parent.width
           text: "This item type isn't supported here yet — open it in the Proton Pass app."
-          color: Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.5)
+          color: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.5)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
           wrapMode: Text.Wrap
@@ -1809,7 +1810,7 @@ BarWidget {
           visible: root.copyFeedback !== ""
           width: parent.width
           text: root.copyFeedback + " — clears in " + root.clipboardClearSeconds + "s"
-          color: Color.accent
+          color: Commons.Color.accent
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
         }

@@ -746,7 +746,12 @@ BarWidget {
     active: root.wrapperInstalled
     iconComponent: Component {
       Item {
-        anchors.fill: parent
+        // No anchors.fill here: BarIconContent loads this via a Loader with
+        // no intrinsic size and sizes the root item through its onLoaded
+        // (item.width/height <= 0 -> sourceSize). anchors.fill would peg us
+        // to the 0x0 Loader and, because anchors win over explicit width,
+        // suppress that fallback — leaving the icon 0x0 and invisible. The
+        // shell's own bar widgets (dropbox, tailscale) use a bare Item here.
         Image {
           anchors.fill: parent
           source: "icon.svg"
